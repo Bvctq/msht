@@ -206,13 +206,16 @@ def api_commission():
     if not shopee_cookie:
         return jsonify({'error': 'Biến SHOPEE_COOKIE trên Vercel đang bị rỗng'}), 500
 
+    # Header chuẩn hóa theo môi trường Trình duyệt PC
     headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
         "content-type": "application/json",
         "cookie": shopee_cookie,
-        "user-agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        ),
+        "origin": "https://affiliate.shopee.vn",
+        "referer": "https://affiliate.shopee.vn/offer/product_offer",
+        "user-agent": USER_AGENT,
+        "x-shopee-language": "vi",
     }
 
     try:
@@ -226,16 +229,16 @@ def api_commission():
             data = resp.json()
         except Exception:
             return jsonify({
-                'error': 'Shopee trả về nội dung không phải JSON',
+                'error': 'Shopee trả về trang HTML thay vì JSON (bị WAF chặn)',
                 'status_code': resp.status_code,
-                'preview': resp.text[:200]
+                'preview': resp.text[:300]
             }), 400
 
-        # Nếu Shopee trả lỗi hoặc không có data, in nguyên văn JSON từ Shopee ra để debug
+        # Kiểm tra dữ liệu trả về từ Shopee
         if data.get("code") != 0 or not data.get("data"):
             return jsonify({
-                'error': 'Shopee từ chối lấy thông tin hoa hồng',
-                'raw_shopee_response': data
+                'error': 'Shopee từ chối request',
+                'shopee_raw_response': data
             }), 400
 
         d = data.get("data") or {}
