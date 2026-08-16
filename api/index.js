@@ -22,24 +22,34 @@ export default async function handler(req, res) {
   }
 }
 
+// Trích csrftoken từ chuỗi cookie
+function getCsrf(cookie) {
+  const m = cookie.match(/csrftoken=([^;]+)/);
+  return m ? m[1] : '';
+}
+
 async function shopeeFetch(path, opts, cookie) {
   const url = `https://affiliate.shopee.vn${path}`;
+  const csrf = getCsrf(cookie);
+  
   const headers = {
     'Cookie': cookie,
     'Content-Type': 'application/json',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Referer': 'https://affiliate.shopee.vn/',
     'Origin': 'https://affiliate.shopee.vn',
+    'X-Requested-With': 'XMLHttpRequest',
+    ...(csrf ? { 'X-CSRFToken': csrf } : {}),
     ...(opts.headers || {}),
   };
-  
+
   const res = await fetch(url, { ...opts, headers });
   const text = await res.text();
   
-  // Log để debug trên Vercel dashboard
-  console.log(`[SHOPEE API] ${path} | Status: ${res.status} | Body: ${text.substring(0, 500)}`);
+  console.log(`[SHOPEE] ${path} | Status: ${res.status} | Body: ${text.substring(0, 800)}`);
   
   let json = null;
   try { json = JSON.parse(text); } catch(e) {}
@@ -47,10 +57,51 @@ async function shopeeFetch(path, opts, cookie) {
   return { status: res.status, text, json, ok: res.ok };
 }
 
+async function resolveShortLink(url) {
+  if (!url.includes('s.shopee.vn')) return url;
+  let cur = url;
+  for (let i = 0; i < 5; i++) {
+    const r = await fetch(cur, { redirect: 'manual', headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (r.status >= 300 && r.status < 400) {
+      const loc = r.headers.get('location');
+      if (!loc) break;
+      cur = loc.startsWith('http') ? loc : new URL(loc, cur).href;
+      if (!cur.includes('s.shopee.vn')) return cur;
+    } else break;
+  }
+  return cur;
+}
+
+function extractIds(url) {
+  const m = url.match(/shopee\.vn\/(?:universal-link\/)?product\/(\d+)\/(\d+)/);
+  if (m) return { shopId: m[1], itemId: m[2] };
+  const item = url.match(/[?&]item_id=(\d+)/);
+  const shop = url.match(/[?&]shopid=(\d+)/i);
+  return { shopId: shop?.[1] || '', itemId: item?.[1] || '' };
+}
+
+function parseVnd(s) {
+  if (!s) return 0;
+  const n = parseInt(String(s).replace(/[₫\s.]/g, '').replace(/,/g, ''), 10);
+  return isNaN(n) ? 0 : n;
+}
+
+function imgUrl(id) {
+  return id ? `https://down-vn.img.susercontent.com/file/${id}` : '';
+}
+
 async function createLink(req, res, cookie) {
-  const { url } = req.body || {};
+  let { url } = req.body || {};
   if (!url?.includes('shopee.vn')) {
     return res.status(400).json({ ok: false, error: 'Thiếu hoặc sai link Shopee' });
+  }
+
+  // Nếu người dùng paste link rút gọn, giải mã ra link gốc trước
+  url = await resolveShortLink(url);
+  
+  // Link gốc phải là dạng shopee.vn/product/... hoặc shopee.vn/... (không phải s.shopee.vn)
+  if (url.includes('s.shopee.vn')) {
+    return res.status(400).json({ ok: false, error: 'Không giải mã được link rút gọn, hãy dán link gốc từ app/web Shopee' });
   }
 
   const body = {
@@ -85,39 +136,6 @@ async function createLink(req, res, cookie) {
   }
 
   return res.json({ ok: true, data: { shortLink: item.shortLink, longLink: item.longLink } });
-}
-
-async function resolveShortLink(url) {
-  if (!url.includes('s.shopee.vn')) return url;
-  let cur = url;
-  for (let i = 0; i < 5; i++) {
-    const r = await fetch(cur, { redirect: 'manual', headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (r.status >= 300 && r.status < 400) {
-      const loc = r.headers.get('location');
-      if (!loc) break;
-      cur = loc.startsWith('http') ? loc : new URL(loc, cur).href;
-      if (!cur.includes('s.shopee.vn')) return cur;
-    } else break;
-  }
-  return cur;
-}
-
-function extractIds(url) {
-  const m = url.match(/shopee\.vn\/(?:universal-link\/)?product\/(\d+)\/(\d+)/);
-  if (m) return { shopId: m[1], itemId: m[2] };
-  const item = url.match(/[?&]item_id=(\d+)/);
-  const shop = url.match(/[?&]shopid=(\d+)/i);
-  return { shopId: shop?.[1] || '', itemId: item?.[1] || '' };
-}
-
-function parseVnd(s) {
-  if (!s) return 0;
-  const n = parseInt(String(s).replace(/[₫\s.]/g, '').replace(/,/g, ''), 10);
-  return isNaN(n) ? 0 : n;
-}
-
-function imgUrl(id) {
-  return id ? `https://down-vn.img.susercontent.com/file/${id}` : '';
 }
 
 async function getCommission(req, res, cookie) {
