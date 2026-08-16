@@ -8,12 +8,18 @@ def clean_cookie(raw):
     return (raw or "").replace('"', "").replace("'", "").strip()
 
 def resolve_url(url):
+    """Resolve link rút gọn → link đích (follow HTTP redirect)"""
     try:
-        r = requests.get(url if url.startswith('http') else 'https://' + url,
+        if not url.startswith('http'):
+            url = 'https://' + url
+        r = requests.get(
+            url,
             headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'},
-            timeout=10, allow_redirects=True)
+            timeout=15,
+            allow_redirects=True
+        )
         return r.url
-    except:
+    except Exception:
         return url
 
 def extract_ids(url):
@@ -25,17 +31,7 @@ def extract_ids(url):
     if m: return m.group(1), m.group(2)
     return None, None
 
-def parse_money(money_str):
-    """Chuyển '₫16.200' → 16200"""
-    if not money_str:
-        return 0
-    try:
-        return int(re.sub(r"[^\d]", "", str(money_str)))
-    except:
-        return 0
-
 def format_money(num):
-    """16200 → '₫16.200'"""
     try:
         return f"₫{int(num):,}".replace(',', '.')
     except:
@@ -57,7 +53,11 @@ def convert():
         "query": "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){shortLink longLink failCode}}",
         "variables": {"linkParams": lp, "sourceCaller": "CUSTOM_LINK_CALLER"}
     }
-    h = {"content-type": "application/json", "cookie": cookie, "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"}
+    h = {
+        "content-type": "application/json",
+        "cookie": cookie,
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    }
     try:
         r = requests.post("https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink", headers=h, json=payload, timeout=20)
         d = r.json()
@@ -76,17 +76,18 @@ def commission():
     raw_url = request.args.get('url', '')
     item_id = request.args.get('item_id', '')
     
-    # Nếu client không gửi item_id, tự extract từ URL
+    # Nếu không có item_id, resolve URL rút gọn rồi extract
     if not item_id:
-        resolved = resolve_url(raw_url) if ('s.shopee.vn' in raw_url or 'shp.ee' in raw_url or 'vn.shp.ee' in raw_url) else raw_url
+        is_short = any(x in raw_url for x in ['s.shopee.vn', 'shp.ee', 'vn.shp.ee'])
+        resolved = resolve_url(raw_url) if is_short else raw_url
         shopid, itemid = extract_ids(resolved)
         item_id = itemid
     
     if not item_id:
-        return jsonify({'success': False, 'debug': 'Cannot extract item_id'}), 200
+        return jsonify({'success': False, 'debug': 'Cannot extract item_id from URL'}), 200
     
     try:
-        # ===== DÙNG API addlivetag.com THAY VÌ Shopee trực tiếp =====
+        # Dùng API addlivetag.com (không cần cookie Shopee)
         r = requests.get(
             f"https://data.addlivetag.com/product-data/product-data.php?item_id={item_id}",
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
@@ -101,41 +102,35 @@ def commission():
         if not info:
             return jsonify({'success': False, 'debug': 'Empty productInfo'}), 200
         
-        # ===== THÔNG TIN SẢN PHẨM =====
         product_name = info.get('productName', 'Sản phẩm Shopee')
-        # imageUrl từ addlivetag đã là URL đầy đủ (có CDN prefix)
-        image = info.get('imageUrl', '')
-        
-        # Giá (addlivetag trả số nguyên VNĐ, VD: 175000)
+        image = info.get('imageUrl', '')  # URL đầy đủ từ addlivetag
         price_val = info.get('price', 0)
         price_str = format_money(price_val) if price_val else ''
         
-        # ===== HOA HỒNG NGƯỜI BÁN (Xtra) =====
-        # sellerComFinal: hoa hồng người bán thực tế, KHÔNG giới hạn trần
+        # Hoa hồng người bán (Xtra) — không giới hạn trần
         seller_com = info.get('sellerComFinal', 0)
         if seller_com is None or not info.get('hasSellerCommission', False):
             seller_com = 0
         
-        # Chia đôi 50/50: user nhận 50%, hệ thống giữ 50%
-        user_cashback_num = seller_com // 2
-        platform_fee_num = seller_com - user_cashback_num
+        # Chia đôi 50/50
+        user_cashback = seller_com // 2
+        platform_fee = seller_com - user_cashback
         
-        # Tỷ lệ % người bán
-        seller_rate_percent = info.get('sellerRatePercent', 0)
-        seller_rate_str = f"{seller_rate_percent}%" if seller_rate_percent else '~5%'
+        seller_rate = info.get('sellerRatePercent', 0)
+        seller_rate_str = f"{seller_rate}%" if seller_rate else '~5%'
         
         return jsonify({
             'success': True,
             'item_id': item_id,
             'product_name': product_name,
-            'image': image,  # URL đầy đủ, không cần ghép CDN
+            'image': image,
             'price': price_str,
             'seller_commission_rate': seller_rate_str,
             'seller_commission': format_money(seller_com),
             'estimated_commission': format_money(seller_com),
-            'estimated_cashback': format_money(user_cashback_num),
-            'user_cashback': format_money(user_cashback_num),
-            'platform_fee': format_money(platform_fee_num),
+            'estimated_cashback': format_money(user_cashback),
+            'user_cashback': format_money(user_cashback),
+            'platform_fee': format_money(platform_fee),
             'cashback_percent': 50,
             'data_source': info.get('dataSource', 'unknown')
         })
@@ -156,7 +151,11 @@ def orders():
         'version': '1'
     })
     cookie = clean_cookie(COOKIE)
-    h = {"content-type": "application/json", "cookie": cookie, "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"}
+    h = {
+        "content-type": "application/json",
+        "cookie": cookie,
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    }
     try:
         r = requests.get(f"https://affiliate.shopee.vn/api/v3/report/list?{qs}", headers=h, timeout=20)
         d = r.json()
@@ -172,7 +171,7 @@ def orders():
                 'product_name': o.get('product_name', ''),
                 'amount': o.get('amount'),
                 'commission': o.get('commission'),
-                'cashback': format_money(n // 2),  # 50% commission thực tế
+                'cashback': format_money(n // 2),
                 'status': o.get('status'),
                 'purchase_time': o.get('purchase_time'),
                 'shop_name': o.get('shop_name', '')
