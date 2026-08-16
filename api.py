@@ -138,7 +138,7 @@ def convert_shopee_links_sync(links, cookies):
                 "query batchGetCustomLink($linkParams: [CustomLinkParam!], "
                 "$sourceCaller: SourceCaller) { "
                 "batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller) "
-                "{ shortLink, failCode } }"
+                "{ shortLink longLink failCode } }"
             ),
             "variables": {
                 "linkParams": [{"originalLink": link} for link in api_links],
@@ -166,8 +166,12 @@ def convert_shopee_links_sync(links, cookies):
                 if idx >= len(links):
                     continue
                 short_link = item.get("shortLink")
+                long_link = item.get("longLink")
                 if short_link:
-                    replace_map[links[idx]] = short_link
+                    replace_map[links[idx]] = {
+                        "short_link": short_link,
+                        "long_link": long_link or short_link
+                    }
 
         except Exception as e:
             print(f"Convert Shopee error: {e}")
@@ -424,17 +428,16 @@ def api_convert():
         return jsonify({'error': 'No Shopee cookie configured'}), 500
 
     result = convert_shopee_links_sync([url], cookies)
-    short_link = result.get(url)
+    mapped = result.get(url)
 
-    if not short_link:
+    if not mapped:
         return jsonify({'error': 'Shopee failed to create link'}), 500
 
-    # Build long link
-    long_link = short_link  # Shopee short link redirects to long link
-    # Actually we need the long link from API
-    # Let's call the API again to get longLink, or construct it
-    # For now, return short_link as affiliate_url
-    affiliate_url = short_link
+    short_link = mapped["short_link"]
+    long_link = mapped["long_link"]
+
+    # Build affiliate_url từ long_link nếu có, nếu không dùng short_link
+    affiliate_url = long_link if long_link else short_link
     if sub_id:
         affiliate_url += ('&' if '?' in affiliate_url else '?') + 'sub_id=' + urllib.parse.quote(sub_id)
 
@@ -464,6 +467,10 @@ def api_commission():
             m = re.search(r'[?&]item_id=(\d+)', purl)
             if m:
                 item_id = m.group(1)
+            else:
+                m = re.search(r'-i\.(\d+)\.(\d+)', purl)
+                if m:
+                    item_id = m.group(2)
 
     if not item_id:
         return jsonify({'error': 'Missing item_id or url'}), 400
@@ -488,17 +495,35 @@ def api_commission():
             return jsonify({'error': 'Shopee API error', 'detail': data}), 500
 
         d = data["data"]
-        comm_str = d.get("commission", "0")
+        
+        # ===== LOGIC 50/50: LẤY HOA HỒNG NGƯỜI BÁN =====
+        # Ưu tiên seller_commission, nếu không có thì lấy commission tổng
+        seller_comm_str = d.get("commission_rate", {}).get("seller_commission", d.get("commission", "0"))
         rate_str = d.get("commission_rate", {}).get("seller_commission_rate", "0%")
-        comm_num = int(re.sub(r"[^\d]", "", comm_str)) if comm_str else 0
-        cashback = comm_num // 2
+        
+        # Parse số tiền (bỏ ₫ và dấu chấm)
+        comm_num = int(re.sub(r"[^\d]", "", seller_comm_str)) if seller_comm_str else 0
+        cashback = comm_num // 2  # User nhận 50%
+
+        # Lấy thông tin sản phẩm
+        product_info = d.get("batch_item_for_item_card_full", {})
+        
+        # Giá Shopee trả về dạng *100000
+        price_raw = product_info.get("price", "0")
+        try:
+            price_num = int(price_raw) / 100000
+            price_str = f"₫{price_num:,.0f}".replace(",", ".")
+        except:
+            price_str = price_raw
 
         return jsonify({
             'success': True,
             'item_id': item_id,
-            'product_name': d.get("batch_item_for_item_card_full", {}).get("name", ""),
+            'product_name': product_info.get("name", "Sản phẩm Shopee"),
+            'image': product_info.get("image", ""),
+            'price': price_str,
             'seller_commission_rate': rate_str,
-            'estimated_commission': comm_str,
+            'estimated_commission': seller_comm_str,   # Hoa hồng người bán
             'estimated_cashback': f"₫{cashback:,}".replace(",", "."),
             'cashback_percent': 50,
         })
@@ -541,7 +566,7 @@ def api_orders():
 
     try:
         resp = requests.get(
-            f"https://affiliate.shopee.vn/api/v3/offer/orders?{qs}",
+            f"https://affiliate.shopee.vn/api/v3/report/list?{qs}",
             headers=headers,
             timeout=20,
         )
@@ -549,7 +574,7 @@ def api_orders():
         if data.get("code") != 0:
             return jsonify({'error': 'Shopee API error', 'detail': data}), 500
 
-        order_list = data.get("data", {}).get("list", [])
+        order_list = data.get("data", {}).get("list") or []
         orders = []
         for o in order_list:
             comm_str = o.get("commission", "0")
@@ -673,7 +698,7 @@ def process_text_with_links(text, chat_id):
 
         if clean_input == raw_in_text or clean_input == raw_url or clean_input == raw_url.replace('https://', ''):
             if typ == 'shopee' and raw_url in shopee_map:
-                send_telegram_message(chat_id, shopee_map[raw_url])
+                send_telegram_message(chat_id, shopee_map[raw_url]["short_link"])
                 return
             elif typ == 'lazada' and raw_url in lazada_map:
                 send_telegram_message(chat_id, lazada_map[raw_url])
@@ -691,7 +716,7 @@ def process_text_with_links(text, chat_id):
 
         if typ == 'shopee':
             if raw_url in shopee_map:
-                parts.append(shopee_map[raw_url])
+                parts.append(shopee_map[raw_url]["short_link"])
             else:
                 parts.append("❌ lỗi")
         else:
