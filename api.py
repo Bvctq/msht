@@ -188,29 +188,29 @@ def api_commission():
     if auth_error:
         return auth_error
 
-    item_id = request.args.get('item_id')
-    purl = request.args.get('url')
+    item_id = (request.args.get('item_id') or '').strip()
+    purl = (request.args.get('url') or '').strip()
 
     if not item_id and purl:
         purl = unshorten_shopee_url(purl)
-        m = re.search(r'product\/(\d+)\/(\d+)', purl)
+        m = (
+            re.search(r'-i\.\d+\.(\d+)', purl)
+            or re.search(r'product\/\d+\/(\d+)', purl)
+            or re.search(r'[?&](?:item_id|itemid|itemId)=(\d+)', purl)
+        )
         if m:
-            item_id = m.group(2)
-        else:
-            m = re.search(r'[?&]item_id=(\d+)', purl)
-            if m:
-                item_id = m.group(1)
-            else:
-                m = re.search(r'-i\.(\d+)\.(\d+)', purl)
-                if m:
-                    item_id = m.group(2)
+            item_id = m.group(1)
 
     if not item_id:
-        return jsonify({'error': 'Missing item_id or url'}), 400
+        return jsonify({'error': 'Missing item_id or url', 'resolved_url': purl}), 400
+
+    shopee_cookie = clean_cookie(SHOPEE_COOKIE)
+    if not shopee_cookie:
+        return jsonify({'error': 'Thiếu SHOPEE_COOKIE'}), 500
 
     headers = {
         "content-type": "application/json",
-        "cookie": clean_cookie(SHOPEE_COOKIE),
+        "cookie": shopee_cookie,
         "user-agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
             "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
@@ -223,40 +223,55 @@ def api_commission():
             headers=headers,
             timeout=20,
         )
-        data = resp.json()
+
+        # Chống crash khi Shopee trả về HTML/403 thay vì JSON
+        try:
+            data = resp.json()
+        except Exception:
+            return jsonify({
+                'error': 'Shopee chặn IP Vercel hoặc Cookie sai cấu trúc',
+                'http_status': resp.status_code,
+                'response_preview': resp.text[:300]
+            }), 400
+
         if data.get("code") != 0 or not data.get("data"):
-            return jsonify({'error': 'Shopee API error', 'detail': data}), 500
+            return jsonify({
+                'error': 'Shopee từ chối request (Cookie hết hạn hoặc không có quyền)',
+                'shopee_code': data.get("code"),
+                'shopee_msg': data.get("message") or data.get("msg")
+            }), 400
 
-        d = data["data"]
+        d = data.get("data") or {}
+        comm_rate_dict = d.get("commission_rate") or {}
+        seller_comm_str = comm_rate_dict.get("seller_commission") or d.get("commission") or "0"
+        rate_str = comm_rate_dict.get("seller_commission_rate") or "0%"
 
-        seller_comm_str = d.get("commission_rate", {}).get("seller_commission", d.get("commission", "0"))
-        rate_str = d.get("commission_rate", {}).get("seller_commission_rate", "0%")
-
-        comm_num = int(re.sub(r"[^\d]", "", seller_comm_str)) if seller_comm_str else 0
+        comm_num = int(re.sub(r"[^\d]", "", str(seller_comm_str))) if seller_comm_str else 0
         cashback = comm_num // 2
 
-        product_info = d.get("batch_item_for_item_card_full", {})
+        product_info = d.get("batch_item_for_item_card_full") or {}
 
-        price_raw = product_info.get("price", "0")
+        price_raw = product_info.get("price") or "0"
         try:
             price_num = int(price_raw) / 100000
             price_str = f"₫{price_num:,.0f}".replace(",", ".")
-        except:
+        except Exception:
             price_str = ""
 
         return jsonify({
             'success': True,
             'item_id': item_id,
-            'product_name': product_info.get("name", "Sản phẩm Shopee"),
-            'image': product_info.get("image", ""),
+            'product_name': product_info.get("name") or "Sản phẩm Shopee",
+            'image': product_info.get("image") or "",
             'price': price_str,
             'seller_commission_rate': rate_str,
             'estimated_commission': seller_comm_str,
             'estimated_cashback': f"₫{cashback:,}".replace(",", "."),
             'cashback_percent': 50,
         })
+
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f'Python Exception: {str(e)}'}), 500
 
 
 @app.route("/api/orders", methods=["GET"])
