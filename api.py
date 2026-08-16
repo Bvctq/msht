@@ -206,7 +206,13 @@ def api_commission():
     if not shopee_cookie:
         return jsonify({'error': 'Biến SHOPEE_COOKIE trên Vercel đang bị rỗng'}), 500
 
-    # Header chuẩn hóa theo môi trường Trình duyệt PC
+    # TỰ ĐỘNG MÓC CSRF TOKEN TỪ COOKIE ĐỂ VƯỢT TƯỜNG LỬA SHOPEE
+    csrftoken = ""
+    csrf_match = re.search(r'csrftoken=([^;]+)', shopee_cookie)
+    if csrf_match:
+        csrftoken = csrf_match.group(1)
+
+    # Thêm x-csrftoken vào Headers
     headers = {
         "accept": "application/json, text/plain, */*",
         "accept-language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -216,6 +222,7 @@ def api_commission():
         "referer": "https://affiliate.shopee.vn/offer/product_offer",
         "user-agent": USER_AGENT,
         "x-shopee-language": "vi",
+        "x-csrftoken": csrftoken,  # <-- Đây là chìa khóa giải quyết mã 90309999
     }
 
     try:
@@ -229,12 +236,11 @@ def api_commission():
             data = resp.json()
         except Exception:
             return jsonify({
-                'error': 'Shopee trả về trang HTML thay vì JSON (bị WAF chặn)',
+                'error': 'Shopee trả về trang HTML thay vì JSON (bị chặn IP)',
                 'status_code': resp.status_code,
                 'preview': resp.text[:300]
             }), 400
 
-        # Kiểm tra dữ liệu trả về từ Shopee
         if data.get("code") != 0 or not data.get("data"):
             return jsonify({
                 'error': 'Shopee từ chối request',
