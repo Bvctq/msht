@@ -46,6 +46,71 @@ def format_shopee_money(num):
     except:
         return "₫0"
 
+# =============  test xong xóa 
+@app.route("/api/test-report", methods=["GET"])
+def test_report():
+    """Test thẳng API report/list của Shopee"""
+    cookie = clean_cookie(COOKIE)
+    if not cookie:
+        return jsonify({'alive': False, 'error': 'Chua co SHOPEE_COOKIE trong env'}), 200
+    
+    sub_id = request.args.get('sub_id', 'addsub')
+    end = int(time.time())
+    start = end - (7 * 24 * 3600)
+    
+    qs = urllib.parse.urlencode({
+        'page_size': '20',
+        'page_num': '1',
+        'sub_id': sub_id,
+        'purchase_time_s': start,
+        'purchase_time_e': end,
+        'version': '1'
+    })
+    
+    h = {
+        "content-type": "application/json",
+        "cookie": cookie,
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+    }
+    
+    try:
+        r = requests.get(f"https://affiliate.shopee.vn/api/v3/report/list?{qs}", headers=h, timeout=15)
+        data = r.json()
+        
+        shopee_code = data.get('code')
+        total = (data.get('data') or {}).get('total_count', 0)
+        lst = (data.get('data') or {}).get('list')
+        
+        if shopee_code == 0 and total > 0:
+            return jsonify({
+                'alive': True,
+                'http_code': r.status_code,
+                'shopee_code': shopee_code,
+                'total_checkouts': total,
+                'message': f'API hoat dong. Co {total} checkout.',
+                'sample': lst[0] if lst else None
+            })
+        elif shopee_code == 0:
+            return jsonify({
+                'alive': True,
+                'http_code': r.status_code,
+                'shopee_code': shopee_code,
+                'total_checkouts': 0,
+                'message': 'API hoat dong nhung khong co don hang (sub_id nay chua co don hoac sai thoi gian).'
+            })
+        else:
+            return jsonify({
+                'alive': False,
+                'http_code': r.status_code,
+                'shopee_code': shopee_code,
+                'message': f'Cookie het han hoac bi chan. Code: {shopee_code}',
+                'raw': data
+            })
+    except Exception as e:
+        return jsonify({'alive': False, 'error': str(e)}), 200
+        
+# =============  
+
 @app.route("/api/convert", methods=["POST"])
 def convert():
     data = request.get_json() or {}
