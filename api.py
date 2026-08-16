@@ -2,74 +2,51 @@ from flask import Flask, request, jsonify
 import os, json, re, urllib.parse, requests
 
 app = Flask(__name__)
-KEY = os.environ.get("INTERNAL_API_KEY", "")
 COOKIE = os.environ.get("SHOPEE_COOKIE", "")
-
-def auth():
-    if request.headers.get('x-api-key', '') != KEY:
-        return jsonify({'error': 'Unauthorized'}), 401
-    return None
 
 def clean_cookie(raw):
     return (raw or "").replace('"', "").replace("'", "").strip()
 
-# ========== TEST COOKIE ==========
-@app.route("/api/test", methods=["POST"])
-def test():
-    err = auth()
-    if err: return err
-    data = request.get_json() or {}
-    cookie = clean_cookie(data.get('cookie', COOKIE))
-    item_id = data.get('item_id', '23881637574')
-    if not cookie: return jsonify({'error': 'No cookie'}), 400
-    h = {
-        "content-type": "application/json",
-        "cookie": cookie,
-        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-        "referer": "https://affiliate.shopee.vn/",
-        "accept": "application/json",
-    }
-    r = requests.get(f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}", headers=h, timeout=20)
-    try:
-        d = r.json()
-    except:
-        return jsonify({'http': r.status_code, 'json': False, 'preview': r.text[:500]}), 200
-    return jsonify({
-        'http': r.status_code, 'json': True,
-        'code': d.get('code'), 'msg': d.get('msg'),
-        'has_commission_rate': bool((d.get('data') or {}).get('commission_rate')),
-        'raw': d
-    }), 200
-
 # ========== CONVERT ==========
 @app.route("/api/convert", methods=["POST"])
 def convert():
-    err = auth()
-    if err: return err
     data = request.get_json() or {}
     url = data.get('url', '').strip()
     sub = data.get('sub_id', '')
-    if not url: return jsonify({'error': 'Missing url'}), 400
+    if not url:
+        return jsonify({'error': 'Missing url'}), 400
+
     cookie = clean_cookie(COOKIE)
-    if not cookie: return jsonify({'error': 'No cookie'}), 500
+    if not cookie:
+        return jsonify({'error': 'No Shopee cookie configured'}), 500
+
     api_url = url if url.startswith('http') else 'https://' + url
     lp = [{"originalLink": api_url}]
-    if sub: lp[0]["advancedLinkParams"] = {"subId1": str(sub)}
+    if sub:
+        lp[0]["advancedLinkParams"] = {"subId1": str(sub)}
+
     payload = {
         "operationName": "batchGetCustomLink",
         "query": "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){shortLink longLink failCode}}",
         "variables": {"linkParams": lp, "sourceCaller": "CUSTOM_LINK_CALLER"}
     }
-    h = {"content-type": "application/json", "cookie": cookie, "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"}
-    r = requests.post("https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink", headers=h, json=payload, timeout=20)
+    h = {
+        "content-type": "application/json",
+        "cookie": cookie,
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    }
     try:
+        r = requests.post("https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink", headers=h, json=payload, timeout=20)
         d = r.json()
         batch = d.get("data", {}).get("batchCustomLink", [])
-        if not batch: return jsonify({'error': 'empty batch', 'raw': d}), 500
+        if not batch:
+            return jsonify({'error': 'empty batch', 'raw': d}), 500
         item = batch[0]
-        if item.get("failCode") != 0: return jsonify({'error': f'failCode {item.get("failCode")}', 'raw': d}), 500
+        if item.get("failCode") != 0:
+            return jsonify({'error': f'failCode {item.get("failCode")}', 'raw': d}), 500
         sl = item.get("shortLink")
-        if not sl: return jsonify({'error': 'no shortLink', 'raw': d}), 500
+        if not sl:
+            return jsonify({'error': 'no shortLink', 'raw': d}), 500
         return jsonify({'success': True, 'affiliate_url': sl, 'short_link': sl, 'sub_id': sub or None})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -77,33 +54,37 @@ def convert():
 # ========== COMMISSION ==========
 @app.route("/api/commission", methods=["GET"])
 def commission():
-    err = auth()
-    if err: return err
     item_id = request.args.get('item_id', '').strip()
     purl = request.args.get('url', '')
+
     if not item_id and purl:
         for pat in [r'product\/(\d+)\/(\d+)', r'[?&]item_id=(\d+)', r'-i\.(\d+)\.(\d+)']:
             m = re.search(pat, purl)
             if m:
                 item_id = m.group(2) if len(m.groups()) > 1 else m.group(1)
                 break
-    if not item_id: return jsonify({'success': False, 'debug': 'Missing item_id'}), 200
+
+    if not item_id:
+        return jsonify({'success': False, 'debug': 'Missing item_id'}), 200
+
     cookie = clean_cookie(COOKIE)
     h = {
         "content-type": "application/json",
         "cookie": cookie,
         "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
         "referer": "https://affiliate.shopee.vn/",
-        "accept": "application/json",
+        "accept": "application/json"
     }
     try:
         r = requests.get(f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}", headers=h, timeout=20)
         try:
             d = r.json()
-        except:
-            return jsonify({'success': False, 'debug': 'Shopee returned HTML/non-JSON', 'http': r.status_code}), 200
+        except Exception:
+            return jsonify({'success': False, 'debug': 'Shopee returned HTML', 'http': r.status_code}), 200
+
         if d.get('code') != 0:
             return jsonify({'success': False, 'debug': 'Shopee error', 'code': d.get('code'), 'msg': d.get('msg'), 'raw': d}), 200
+
         data = d.get('data', {})
         cr = data.get('commission_rate') or {}
         seller_comm = str(cr.get('seller_commission') or data.get('commission') or '0')
@@ -116,6 +97,7 @@ def commission():
             price = f"₫{int(price_raw)/100000:,.0f}".replace(',', '.')
         except:
             price = ''
+
         return jsonify({
             'success': True,
             'item_id': item_id,
@@ -133,10 +115,10 @@ def commission():
 # ========== ORDERS ==========
 @app.route("/api/orders", methods=["GET"])
 def orders():
-    err = auth()
-    if err: return err
     sub_id = request.args.get('sub_id')
-    if not sub_id: return jsonify({'error': 'Missing sub_id'}), 400
+    if not sub_id:
+        return jsonify({'error': 'Missing sub_id'}), 400
+
     qs = urllib.parse.urlencode({
         'page_size': request.args.get('page_size', '20'),
         'page_num': request.args.get('page_num', '1'),
@@ -146,11 +128,16 @@ def orders():
         'version': '1'
     })
     cookie = clean_cookie(COOKIE)
-    h = {"content-type": "application/json", "cookie": cookie, "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"}
+    h = {
+        "content-type": "application/json",
+        "cookie": cookie,
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    }
     try:
         r = requests.get(f"https://affiliate.shopee.vn/api/v3/report/list?{qs}", headers=h, timeout=20)
         d = r.json()
-        if d.get('code') != 0: return jsonify({'error': 'Shopee error', 'detail': d}), 500
+        if d.get('code') != 0:
+            return jsonify({'error': 'Shopee error', 'detail': d}), 500
         lst = (d.get('data') or {}).get('list') or []
         out = []
         for o in lst:
@@ -172,6 +159,33 @@ def orders():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# ========== TEST COOKIE ==========
+@app.route("/api/test", methods=["POST"])
+def test():
+    data = request.get_json() or {}
+    cookie = clean_cookie(data.get('cookie', COOKIE))
+    item_id = data.get('item_id', '23881637574')
+    if not cookie:
+        return jsonify({'error': 'No cookie'}), 400
+    h = {
+        "content-type": "application/json",
+        "cookie": cookie,
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+        "referer": "https://affiliate.shopee.vn/",
+        "accept": "application/json"
+    }
+    r = requests.get(f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}", headers=h, timeout=20)
+    try:
+        d = r.json()
+    except:
+        return jsonify({'http': r.status_code, 'json': False, 'preview': r.text[:500]}), 200
+    return jsonify({
+        'http': r.status_code, 'json': True,
+        'code': d.get('code'), 'msg': d.get('msg'),
+        'has_commission_rate': bool((d.get('data') or {}).get('commission_rate')),
+        'raw': d
+    }), 200
 
 @app.route("/", methods=["GET"])
 def health():
