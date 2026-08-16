@@ -2,7 +2,8 @@ import os
 import json
 import re
 import urllib.parse
-import requests
+from curl_cffi import request
+# import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -225,10 +226,11 @@ def api_commission():
         "x-csrftoken": csrftoken,  # <-- Đây là chìa khóa giải quyết mã 90309999
     }
 
-    try:
+   try:
         resp = requests.get(
             f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}",
             headers=headers,
+            impersonate="chrome110", # <-- Chìa khóa để fake vân tay Chrome
             timeout=20,
         )
 
