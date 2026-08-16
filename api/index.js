@@ -1,3 +1,7 @@
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+
 const SHOPEE_COOKIE = process.env.SHOPEE_COOKIE || '';
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || '';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -19,33 +23,58 @@ function auth(req) {
   return (req.headers['x-api-key'] || '') === INTERNAL_API_KEY;
 }
 
-async function shopeeFetch(url, opts = {}) {
-  const res = await fetch(url, {
-    ...opts,
-    headers: {
-      'Cookie': SHOPEE_COOKIE,
-      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
-      'Accept': 'application/json',
-      'Accept-Language': 'vi-VN,vi;q=0.9',
-      'Referer': 'https://affiliate.shopee.vn/',
-      'Origin': 'https://affiliate.shopee.vn',
-      'Content-Type': 'application/json',
-      ...(opts.headers || {})
-    }
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error('Shopee ' + res.status + ': ' + txt.slice(0, 300));
-  }
-  return res.json();
-}
+// ===== HTTPS REQUEST using native Node.js (full control) =====
+function shopeeRequest(urlStr, method, postData) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(urlStr);
 
-async function resolveShort(url) {
-  try {
-    const r = await fetch(url, { method: 'HEAD', redirect: 'manual',
-      headers: { 'User-Agent': 'Mozilla/5.0' } });
-    return r.headers.get('location') || '';
-  } catch(e) { return ''; }
+    const options = {
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      method: method,
+      headers: {
+        'Cookie': SHOPEE_COOKIE,
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+        'Accept': 'application/json',
+        'Accept-Language': 'vi-VN,vi;q=0.9',
+        'Referer': 'https://affiliate.shopee.vn/',
+        'Origin': 'https://affiliate.shopee.vn',
+        'Content-Type': 'application/json'
+      }
+    };
+
+    console.log('[DEBUG] Request to:', urlStr);
+    console.log('[DEBUG] Cookie length:', SHOPEE_COOKIE.length);
+    console.log('[DEBUG] Cookie first 100 chars:', SHOPEE_COOKIE.substring(0, 100));
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        console.log('[DEBUG] Response status:', res.statusCode);
+        console.log('[DEBUG] Response first 200 chars:', data.substring(0, 200));
+        if (res.statusCode !== 200) {
+          reject(new Error('Shopee ' + res.statusCode + ': ' + data.substring(0, 300)));
+        } else {
+          try {
+            resolve(JSON.parse(data));
+          } catch(e) {
+            resolve(data);
+          }
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      console.log('[DEBUG] Request error:', err.message);
+      reject(err);
+    });
+
+    if (postData) {
+      req.write(JSON.stringify(postData));
+    }
+    req.end();
+  });
 }
 
 function extractItemId(url) {
@@ -73,41 +102,35 @@ async function handleConvert(req, res) {
 
   const payload = {
     operationName: "batchGetCustomLink",
-    query: `query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){
-      batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){
-        shortLink
-        longLink
-        failCode
-      }
-    }`,
+    query: "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){ batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){ shortLink longLink failCode } }",
     variables: {
       linkParams: [{ originalLink: url }],
       sourceCaller: "CUSTOM_LINK_CALLER"
     }
   };
 
-  const result = await shopeeFetch('https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink', {
-    method: 'POST',
-    body: JSON.stringify(payload)
-  });
+  try {
+    const result = await shopeeRequest('https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink', 'POST', payload);
+    const link = result?.data?.batchCustomLink?.[0];
+    if (!link || link.failCode !== 0) {
+      return json(res, 500, { error: 'Shopee failed', detail: link });
+    }
 
-  const link = result?.data?.batchCustomLink?.[0];
-  if (!link || link.failCode !== 0) {
-    return json(res, 500, { error: 'Shopee failed', detail: link });
+    let long = link.longLink;
+    if (sub_id) {
+      long += (long.includes('?') ? '&' : '?') + 'sub_id=' + encodeURIComponent(sub_id);
+    }
+
+    json(res, 200, {
+      success: true,
+      original_url: url,
+      sub_id: sub_id || null,
+      affiliate_url: long,
+      short_link: link.shortLink
+    });
+  } catch (err) {
+    json(res, 500, { error: err.message });
   }
-
-  let long = link.longLink;
-  if (sub_id) {
-    long += (long.includes('?') ? '&' : '?') + 'sub_id=' + encodeURIComponent(sub_id);
-  }
-
-  json(res, 200, {
-    success: true,
-    original_url: url,
-    sub_id: sub_id || null,
-    affiliate_url: long,
-    short_link: link.shortLink
-  });
 }
 
 async function handleCommission(req, res, urlObj) {
@@ -115,35 +138,39 @@ async function handleCommission(req, res, urlObj) {
   const purl = urlObj.searchParams.get('url');
 
   if (!itemId && purl) {
-    const resolved = await resolveShort(purl);
-    itemId = extractItemId(resolved);
+    // Resolve short URL if needed
+    itemId = extractItemId(purl);
   }
   if (!itemId) return json(res, 400, { error: 'Missing item_id or url' });
 
-  const data = await shopeeFetch('https://affiliate.shopee.vn/api/v3/offer/product?item_id=' + itemId);
-  if (data.code !== 0 || !data.data) {
-    return json(res, 500, { error: 'Shopee API error', detail: data });
+  try {
+    const data = await shopeeRequest('https://affiliate.shopee.vn/api/v3/offer/product?item_id=' + itemId, 'GET');
+    if (data.code !== 0 || !data.data) {
+      return json(res, 500, { error: 'Shopee API error', detail: data });
+    }
+
+    const d = data.data;
+    const commStr = d.commission || '0';
+    const rateStr = d.commission_rate?.seller_commission_rate || d.commission_rate?.default_commission_rate || '0%';
+    const commNum = parseInt(commStr.replace(/[^\d]/g, '')) || 0;
+    const cashback = Math.floor(commNum / 2);
+
+    json(res, 200, {
+      success: true,
+      item_id: itemId,
+      product_name: d.batch_item_for_item_card_full?.name || '',
+      seller_commission_rate: rateStr,
+      estimated_commission: commStr,
+      estimated_cashback: fmtVND(cashback),
+      cashback_percent: 50,
+      price: d.batch_item_for_item_card_full?.price
+        ? (parseInt(d.batch_item_for_item_card_full.price) / 100000).toLocaleString('vi-VN') + '\u0111'
+        : '',
+      image: d.batch_item_for_item_card_full?.image || ''
+    });
+  } catch (err) {
+    json(res, 500, { error: err.message });
   }
-
-  const d = data.data;
-  const commStr = d.commission || '0';
-  const rateStr = d.commission_rate?.seller_commission_rate || d.commission_rate?.default_commission_rate || '0%';
-  const commNum = parseInt(commStr.replace(/[^\d]/g, '')) || 0;
-  const cashback = Math.floor(commNum / 2);
-
-  json(res, 200, {
-    success: true,
-    item_id: itemId,
-    product_name: d.batch_item_for_item_card_full?.name || '',
-    seller_commission_rate: rateStr,
-    estimated_commission: commStr,
-    estimated_cashback: fmtVND(cashback),
-    cashback_percent: 50,
-    price: d.batch_item_for_item_card_full?.price
-      ? (parseInt(d.batch_item_for_item_card_full.price) / 100000).toLocaleString('vi-VN') + '\u0111'
-      : '',
-    image: d.batch_item_for_item_card_full?.image || ''
-  });
 }
 
 async function handleOrders(req, res, urlObj) {
@@ -158,31 +185,46 @@ async function handleOrders(req, res, urlObj) {
   const qs = new URLSearchParams({ page_size: pageSize, page_num: pageNum, sub_id: subId,
     purchase_time_s: start, purchase_time_e: end, version: '1' });
 
-  const data = await shopeeFetch('https://affiliate.shopee.vn/api/v3/offer/orders?' + qs.toString());
-  if (data.code !== 0) return json(res, 500, { error: 'Shopee API error', detail: data });
+  try {
+    const data = await shopeeRequest('https://affiliate.shopee.vn/api/v3/offer/orders?' + qs.toString(), 'GET');
+    if (data.code !== 0) return json(res, 500, { error: 'Shopee API error', detail: data });
 
-  const list = data.data?.list || [];
-  const orders = list.map(o => {
-    const comm = parseInt((o.commission || '0').replace(/[^\d]/g, '')) || 0;
-    return {
-      order_sn: o.order_sn,
-      item_id: o.item_id,
-      product_name: o.product_name || '',
-      amount: o.amount,
-      commission: o.commission,
-      cashback: fmtVND(Math.floor(comm / 2)),
-      status: o.status,
-      purchase_time: o.purchase_time,
-      shop_name: o.shop_name || ''
-    };
-  });
+    const list = data.data?.list || [];
+    const orders = list.map(o => {
+      const comm = parseInt((o.commission || '0').replace(/[^\d]/g, '')) || 0;
+      return {
+        order_sn: o.order_sn,
+        item_id: o.item_id,
+        product_name: o.product_name || '',
+        amount: o.amount,
+        commission: o.commission,
+        cashback: fmtVND(Math.floor(comm / 2)),
+        status: o.status,
+        purchase_time: o.purchase_time,
+        shop_name: o.shop_name || ''
+      };
+    });
 
+    json(res, 200, {
+      success: true, sub_id: subId,
+      page_num: data.data?.page_num || 1,
+      page_size: data.data?.page_size || 20,
+      total_count: data.data?.total_count || 0,
+      orders
+    });
+  } catch (err) {
+    json(res, 500, { error: err.message });
+  }
+}
+
+// ===== DEBUG ENDPOINT =====
+function handleDebug(req, res) {
   json(res, 200, {
-    success: true, sub_id: subId,
-    page_num: data.data?.page_num || 1,
-    page_size: data.data?.page_size || 20,
-    total_count: data.data?.total_count || 0,
-    orders
+    cookie_length: SHOPEE_COOKIE.length,
+    cookie_preview: SHOPEE_COOKIE.substring(0, 200) + (SHOPEE_COOKIE.length > 200 ? '...' : ''),
+    has_cookie: SHOPEE_COOKIE.length > 0,
+    api_key_set: INTERNAL_API_KEY.length > 0,
+    node_version: process.version
   });
 }
 
@@ -196,6 +238,9 @@ module.exports = async (req, res) => {
     const urlObj = new URL(req.url, 'http://localhost');
     const path = urlObj.pathname.replace(/^\/api/, '').replace(/^\//, '');
 
+    if (path === 'debug') {
+      return handleDebug(req, res);
+    }
     if (path === 'convert' && req.method === 'POST') {
       return await handleConvert(req, res);
     }
