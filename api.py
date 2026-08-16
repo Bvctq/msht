@@ -1,330 +1,252 @@
-from flask import Flask, request, jsonify
-import os, json, re, urllib.parse, requests
+<?php
+require_once 'config.php';
+requireLogin();
 
-app = Flask(__name__)
-COOKIE = os.environ.get("SHOPEE_COOKIE", "")
+/**
+ * Resolve link rút gọn s.shopee.vn / shp.ee → link đích
+ */
+function resolveShopeeUrl($url) {
+    if (strpos($url, 's.shopee.vn') === false && strpos($url, 'shp.ee') === false) {
+        return $url;
+    }
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_NOBODY, true); // chỉ cần header
+    curl_setopt($ch, CURLOPT_USERAGENT, 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15');
+    curl_exec($ch);
+    $resolved = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+    curl_close($ch);
+    
+    if ($resolved && filter_var($resolved, FILTER_VALIDATE_URL) && $resolved !== $url) {
+        return $resolved;
+    }
+    return $url;
+}
 
-def clean_cookie(raw):
-    return (raw or "").replace('"', "").replace("'", "").strip()
+$result = null;
+$commission = null;
+$error = '';
+$debug_error = '';
 
-def resolve_url(url):
-    try:
-        r = requests.get(url if url.startswith('http') else 'https://' + url,
-            headers={'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15'},
-            timeout=10, allow_redirects=True)
-        return r.url
-    except:
-        return url
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $url = trim($_POST['url'] ?? '');
 
-def extract_ids(url):
-    m = re.search(r'\/(\d+)\/(\d+)(?:\?|$|&)', url)
-    if m: return m.group(1), m.group(2)
-    m = re.search(r'[?&]item_id=(\d+)', url)
-    if m: return None, m.group(1)
-    m = re.search(r'-i\.(\d+)\.(\d+)', url)
-    if m: return m.group(1), m.group(2)
-    return None, None
+    if (empty($url) || !filter_var($url, FILTER_VALIDATE_URL)) {
+        $error = 'Vui lòng nhập link Shopee hợp lệ';
+    } else {
+        // 1. Tạo link affiliate (dùng URL gốc, Shopee affiliate tự xử lý)
+        $apiResult = callVercelAPI('/api/convert', 'POST', [
+            'url' => $url,
+            'sub_id' => $_SESSION['username']
+        ]);
 
-def parse_vnd_number(vnd_str):
-    if not vnd_str:
-        return 0
-    try:
-        return int(re.sub(r"[^\d]", "", str(vnd_str)))
-    except:
-        return 0
+        if (isset($apiResult['error'])) {
+            $error = 'Lỗi API: ' . $apiResult['error'];
+            error_log('[SaleVN] Convert error: ' . json_encode($apiResult));
+        } elseif (!empty($apiResult['success'])) {
+            $result = $apiResult;
 
-def format_vnd(num):
-    try:
-        return f"₫{int(num):,}".replace(',', '.')
-    except:
-        return "₫0"
+            // 2. Resolve link rút gọn → link đích để lấy item_id
+            $resolvedUrl = resolveShopeeUrl($url);
+            error_log('[SaleVN] Resolved: ' . $resolvedUrl);
 
-def get_csrf_from_cookie(cookie_str):
-    """Extract csrftoken from cookie string if present"""
-    m = re.search(r'csrftoken=([^;]+)', cookie_str)
-    if m:
-        return m.group(1)
-    return ''
+            // 3. Extract item_id từ URL đÃ resolve
+            $itemId = null;
+            if (preg_match('/[?&]item_id=(\d+)/', $resolvedUrl, $m)) {
+                $itemId = $m[1];
+            } elseif (preg_match('/product\/(\d+)\/(\d+)/', $resolvedUrl, $m)) {
+                $itemId = $m[2];
+            } elseif (preg_match('/-i\.(\d+)\.(\d+)/', $resolvedUrl, $m)) {
+                $itemId = $m[2];
+            }
 
-def get_product_public(shopid, itemid):
-    """Fallback: lấy thông tin SP từ API public"""
-    try:
-        r = requests.get(
-            f"https://shopee.vn/api/v4/item/get?itemid={itemid}&shopid={shopid}",
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json',
-                'Referer': f'https://shopee.vn/product/{shopid}/{itemid}'
-            }, timeout=10)
-        d = r.json()
-        if not d.get('data') or not d['data'].get('item'):
-            return None
-        item = d['data']['item']
-        p = item.get('price', 0)
-        try:
-            price = f"₫{int(p)/100000:,.0f}".replace(',', '.')
-        except:
-            price = ''
-        return {
-            'name': item.get('name', 'Sản phẩm'),
-            'image': item.get('image', ''),
-            'price': price,
-            'raw_price': int(p) if p else 0
+            // 4. Gọi API lấy thông tin hoa hồng (qua addlivetag.com)
+            if ($itemId) {
+                $commResult = callVercelAPI(
+                    '/api/commission?item_id=' . urlencode($itemId) . '&url=' . urlencode($resolvedUrl),
+                    'GET'
+                );
+
+                if (isset($commResult['error'])) {
+                    $debug_error = 'Commission: ' . $commResult['error'];
+                    error_log('[SaleVN] ' . $debug_error . ' | ItemID=' . $itemId);
+                } elseif (!empty($commResult['success'])) {
+                    $commission = $commResult;
+                }
+            } else {
+                $debug_error = 'Không trích xuất được item_id từ link rút gọn';
+                error_log('[SaleVN] ' . $debug_error . ' | Resolved=' . $resolvedUrl);
+            }
+
+            // 5. Lưu DB
+            if ($conn) {
+                $stmt = $conn->prepare("INSERT INTO converted_links 
+                    (user_id, original_url, affiliate_url, short_link, sub_id, item_id) 
+                    VALUES (?, ?, ?, ?, ?, ?)");
+                $stmt->bind_param('isssss', 
+                    $_SESSION['user_id'], 
+                    $url, 
+                    $result['affiliate_url'], 
+                    $result['short_link'], 
+                    $_SESSION['username'],
+                    $itemId
+                );
+                $stmt->execute();
+            }
+        } else {
+            $error = 'Không thể tạo link affiliate';
+            error_log('[SaleVN] Convert failed: ' . json_encode($apiResult));
         }
-    except Exception as e:
-        print(f"[SaleVN API] Public API error: {e}")
-        return None
-
-@app.route("/api/convert", methods=["POST"])
-def convert():
-    data = request.get_json() or {}
-    url = data.get('url', '').strip()
-    sub = data.get('sub_id', '')
-    if not url: return jsonify({'error': 'Missing url'}), 400
-    cookie = clean_cookie(COOKIE)
-    if not cookie: return jsonify({'error': 'No cookie'}), 500
-    api_url = url if url.startswith('http') else 'https://' + url
-    lp = [{"originalLink": api_url}]
-    if sub: lp[0]["advancedLinkParams"] = {"subId1": str(sub)}
-    payload = {
-        "operationName": "batchGetCustomLink",
-        "query": "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){shortLink longLink failCode}}",
-        "variables": {"linkParams": lp, "sourceCaller": "CUSTOM_LINK_CALLER"}
     }
-    h = {
-        "content-type": "application/json",
-        "cookie": cookie,
-        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-    }
-    try:
-        r = requests.post("https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink", headers=h, json=payload, timeout=20)
-        d = r.json()
-        batch = d.get("data", {}).get("batchCustomLink", [])
-        if not batch: return jsonify({'error': 'empty batch'}), 500
-        item = batch[0]
-        if item.get("failCode") != 0: return jsonify({'error': f'failCode {item.get("failCode")}'}), 500
-        sl = item.get("shortLink")
-        if not sl: return jsonify({'error': 'no shortLink'}), 500
-        return jsonify({'success': True, 'affiliate_url': sl, 'short_link': sl, 'sub_id': sub or None})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+}
+?>
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chuyển đổi link - SaleVN</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:'Segoe UI',Tahoma,sans-serif}
+body{background:#f5f5f5;min-height:100vh;padding:20px}
+.container{max-width:680px;margin:0 auto}
+.header{background:#ee4d2d;color:#fff;padding:20px;border-radius:12px 12px 0 0;text-align:center}
+.header h1{font-size:22px}
+.header a{color:#fff;text-decoration:none;font-size:14px;opacity:.9;margin:0 8px}
+.box{background:#fff;padding:30px;border-radius:0 0 12px 12px;box-shadow:0 4px 20px rgba(0,0,0,.08);margin-bottom:20px}
+.form-group{margin-bottom:20px}
+label{display:block;margin-bottom:8px;font-weight:600;color:#333;font-size:14px}
+input[type="url"]{width:100%;padding:14px;border:2px solid #ddd;border-radius:10px;font-size:15px}
+input:focus{outline:none;border-color:#ee4d2d}
+button[type="submit"]{padding:14px 28px;background:#ee4d2d;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer}
+button[type="submit"]:hover{background:#d73211}
+.msg{padding:14px;border-radius:10px;margin-bottom:20px;font-size:14px}
+.error{background:#ffe5e5;color:#c00}
+.product-card{background:#f8f9fa;border-radius:12px;overflow:hidden;margin-top:20px;border:1px solid #e9ecef}
+.product-top{display:flex;gap:16px;padding:20px;align-items:flex-start;background:#fff}
+.product-top img{width:110px;height:110px;object-fit:cover;border-radius:10px;border:1px solid #eee;flex-shrink:0}
+.product-meta{flex:1}
+.product-name{font-size:17px;font-weight:700;color:#333;line-height:1.4;margin-bottom:6px}
+.product-price{font-size:20px;font-weight:800;color:#ee4d2d}
+.comm-rate{font-size:13px;color:#28a745;font-weight:600;margin-top:6px}
+.comm-rate span{background:#e5f5e5;padding:3px 10px;border-radius:4px}
+.cashback-bar{background:linear-gradient(90deg,#28a745,#34ce57);color:#fff;padding:16px 20px;display:flex;align-items:center;justify-content:space-between}
+.cashback-bar .left{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600}
+.cashback-bar .left svg{width:22px;height:22px}
+.cashback-bar .right{font-size:24px;font-weight:800}
+.comm-breakdown{padding:14px 20px;background:#fff;border-top:1px dashed #e9ecef;font-size:13px;color:#555}
+.comm-breakdown .row{display:flex;justify-content:space-between;margin-bottom:6px}
+.comm-breakdown .row:last-child{margin-bottom:0;padding-top:6px;border-top:1px solid #f0f0f0}
+.comm-breakdown .val{color:#333;font-weight:600}
+.link-section{padding:20px;background:#fff}
+.link-section label{font-size:13px;color:#666;font-weight:600;margin-bottom:6px;display:block}
+.link-box{background:#f8f9fa;padding:12px 14px;border-radius:8px;border:1px solid #e9ecef;word-break:break-all;font-size:14px;color:#333;margin-bottom:10px}
+.copy-btn{background:#333;color:#fff;padding:10px 18px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
+.copy-btn:hover{background:#555}
+.tips{margin-top:24px;padding:16px;background:#f0f8ff;border-radius:10px;font-size:14px;color:#444}
+.tips strong{color:#ee4d2d}
+.debug-info{color:#999;font-size:12px;margin-top:8px;text-align:center}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>🛒 Chuyển đổi link Shopee</h1>
+<div style="margin-top:8px">
+<a href="index.php">← Về trang chủ</a>
+<a href="dashboard.php">📊 Dashboard</a>
+<a href="logout.php">Đăng xuất</a>
+</div>
+</div>
 
-@app.route("/api/commission", methods=["GET"])
-def commission():
-    item_id = request.args.get('item_id', '')
-    shop_id = request.args.get('shop_id', '')
-    raw_url = request.args.get('url', '')
+<div class="box">
+<?php if ($error): ?><div class="msg error"><?php echo htmlspecialchars($error); ?></div><?php endif; ?>
 
-    if not item_id:
-        return jsonify({'success': False, 'error': 'Missing item_id'}), 200
+<form method="POST" action="">
+<div class="form-group">
+<label>🔗 Dán link Shopee vào đây</label>
+<input type="url" name="url" placeholder="https://shopee.vn/product/... hoặc https://s.shopee.vn/..." required>
+</div>
+<button type="submit">⚡ Tạo link hoàn tiền</button>
+</form>
 
-    cookie = clean_cookie(COOKIE)
-    if not cookie:
-        return jsonify({'success': False, 'error': 'No cookie configured on server'}), 200
+<?php if ($result): ?>
 
-    # Thử lấy từ API affiliate trước
-    affiliate_data = None
-    try:
-        csrf = get_csrf_from_cookie(cookie)
-        h = {
-            "accept": "application/json",
-            "content-type": "application/json",
-            "cookie": cookie,
-            "origin": "https://affiliate.shopee.vn",
-            "referer": f"https://affiliate.shopee.vn/offer/product?item_id={item_id}",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "x-requested-with": "XMLHttpRequest",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin"
-        }
-        if csrf:
-            h["x-csrftoken"] = csrf
+<?php if ($commission): ?>
+<div class="product-card">
+    <div class="product-top">
+        <?php if (!empty($commission['image'])): ?>
+        <img src="<?php echo htmlspecialchars($commission['image']); ?>" alt="" onerror="this.src='https://placehold.co/110x110?text=Shopee'">
+        <?php else: ?>
+        <img src="https://placehold.co/110x110?text=Shopee" alt="">
+        <?php endif; ?>
+        <div class="product-meta">
+            <div class="product-name"><?php echo htmlspecialchars($commission['product_name'] ?? 'Sản phẩm Shopee'); ?></div>
+            <?php if (!empty($commission['price']) && $commission['price'] !== '₫0'): ?>
+            <div class="product-price"><?php echo htmlspecialchars($commission['price']); ?></div>
+            <?php endif; ?>
+            <?php if (!empty($commission['seller_commission_rate'])): ?>
+            <div class="comm-rate">
+                <span>💰 Hoa hồng người bán: <?php echo htmlspecialchars($commission['seller_commission_rate']); ?></span>
+            </div>
+            <?php endif; ?>
+        </div>
+    </div>
+    
+    <div class="cashback-bar">
+        <div class="left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+            Bạn nhận lại (50%):
+        </div>
+        <div class="right"><?php echo htmlspecialchars($commission['estimated_cashback'] ?? '₫0'); ?></div>
+    </div>
+    
+    <div class="comm-breakdown">
+        <div class="row">
+            <span>Tổng hoa hồng người bán:</span>
+            <span class="val"><?php echo htmlspecialchars($commission['seller_commission'] ?? '—'); ?></span>
+        </div>
+        <div class="row">
+            <span>Hệ thống giữ (50%):</span>
+            <span class="val"><?php echo htmlspecialchars($commission['platform_fee'] ?? '—'); ?></span>
+        </div>
+        <div class="row">
+            <span style="color:#28a745;font-weight:700">🎁 Bạn nhận (50%):</span>
+            <span class="val" style="color:#28a745;font-weight:700"><?php echo htmlspecialchars($commission['user_cashback'] ?? '—'); ?></span>
+        </div>
+    </div>
+</div>
+<?php elseif ($debug_error): ?>
+<div class="debug-info">⚠️ <?php echo htmlspecialchars($debug_error); ?></div>
+<?php endif; ?>
 
-        # Thử GET trước
-        qs = f"item_id={item_id}"
-        if shop_id:
-            qs += f"&shop_id={shop_id}"
+<div class="link-section" style="margin-top:20px">
+    <label>📋 Link chia sẻ (rút gọn)</label>
+    <div class="link-box" id="shortLink"><?php echo htmlspecialchars($result['short_link']); ?></div>
+    <button class="copy-btn" onclick="copyText('shortLink')">📋 Copy link</button>
+</div>
 
-        api_url = f"https://affiliate.shopee.vn/api/v3/offer/product?{qs}"
-        print(f"[SaleVN API] GET {api_url}")
-        r = requests.get(api_url, headers=h, timeout=20)
-        print(f"[SaleVN API] GET status: {r.status_code}, len: {len(r.text)}")
+<?php endif; ?>
 
-        # Nếu GET 403, thử POST
-        if r.status_code == 403:
-            print("[SaleVN API] GET 403, trying POST...")
-            post_body = {"item_id": str(item_id)}
-            if shop_id:
-                post_body["shop_id"] = str(shop_id)
-            r = requests.post(
-                "https://affiliate.shopee.vn/api/v3/offer/product",
-                headers=h, json=post_body, timeout=20
-            )
-            print(f"[SaleVN API] POST status: {r.status_code}, len: {len(r.text)}")
+<div class="tips">
+<strong>💡 Hướng dẫn:</strong><br>
+1. Dán link sản phẩm Shopee (link đầy đủ hoặc link rút gọn)<br>
+2. Nhấn "Tạo link hoàn tiền"<br>
+3. Copy link và chia sẻ cho bạn bè<br>
+4. Khi có người mua qua link, bạn nhận <strong>50% hoa hồng người bán</strong>!
+</div>
+</div>
+</div>
 
-        if r.status_code != 200:
-            raw_snippet = r.text[:300]
-            print(f"[SaleVN API] Raw: {raw_snippet}")
-            # Không return lỗi ngay, chuyển sang fallback
-            raise Exception(f"HTTP {r.status_code}")
-
-        try:
-            d = r.json()
-        except Exception as je:
-            print(f"[SaleVN API] JSON parse error: {je}")
-            raise Exception("JSON parse error")
-
-        shopee_code = d.get('code')
-        shopee_msg = d.get('msg', '')
-
-        if shopee_code != 0:
-            print(f"[SaleVN API] Shopee code={shopee_code}, msg={shopee_msg}")
-            raise Exception(f"Shopee API error: {shopee_msg} (code {shopee_code})")
-
-        data = d.get('data')
-        if not data:
-            raise Exception("Empty data")
-
-        affiliate_data = data
-
-    except Exception as e:
-        print(f"[SaleVN API] Affiliate API failed: {e}")
-        affiliate_data = None
-
-    # Nếu affiliate thất bại, dùng public API làm fallback
-    if not affiliate_data:
-        if not shop_id:
-            # Thử extract shop_id từ URL
-            sid, _ = extract_ids(raw_url)
-            if sid:
-                shop_id = sid
-
-        if not shop_id:
-            return jsonify({
-                'success': False,
-                'error': 'Không thể lấy thông tin hoa hồng. Vui lòng đảm bảo cookie affiliate còn hiệu lực.'
-            }), 200
-
-        pub = get_product_public(shop_id, item_id)
-        if not pub:
-            return jsonify({
-                'success': False,
-                'error': 'Không thể lấy thông tin sản phẩm từ cả 2 nguồn.'
-            }), 200
-
-        # Fallback: hiển thị thông tin SP + hoàn tiền ước tính theo % chung
-        price_val = pub['raw_price']
-        est_comm = int(price_val * 0.05 / 100000)  # ước tính 5%
-        cashback = est_comm // 2
-
-        return jsonify({
-            'success': True,
-            'item_id': item_id,
-            'product_name': pub['name'],
-            'image': pub['image'],
-            'price': pub['price'],
-            'seller_commission_rate': '~5% (ước tính)',
-            'estimated_commission': format_vnd(est_comm),
-            'estimated_cashback': format_vnd(cashback),
-            'cashback_percent': 50,
-            'note': 'Ước tính do API affiliate bị chặn (403). Số tiền thực tế có thể khác.'
-        })
-
-    # Xử lý dữ liệu affiliate
-    try:
-        data = affiliate_data
-        item = data.get('batch_item_for_item_card_full') or {}
-
-        product_name = item.get('name', 'Sản phẩm Shopee')
-        image = item.get('image', '')
-
-        raw_price = item.get('price', '0')
-        try:
-            price_val = int(raw_price) / 100000
-            price_str = f"₫{price_val:,.0f}".replace(',', '.')
-        except Exception:
-            price_str = ''
-            price_val = 0
-
-        comm_rate = data.get('commission_rate', {})
-        seller_commission_str = comm_rate.get('seller_commission') or data.get('commission', '₫0') or '₫0'
-        seller_commission_num = parse_vnd_number(seller_commission_str)
-        seller_rate = comm_rate.get('seller_commission_rate', '~5%')
-
-        cashback_num = seller_commission_num // 2
-        cashback_str = format_vnd(cashback_num)
-
-        print(f"[SaleVN API] OK item={item_id} comm={seller_commission_str} cashback={cashback_str}")
-
-        return jsonify({
-            'success': True,
-            'item_id': item_id,
-            'product_name': product_name,
-            'image': image,
-            'price': price_str,
-            'seller_commission_rate': seller_rate,
-            'estimated_commission': seller_commission_str,
-            'estimated_cashback': cashback_str,
-            'cashback_percent': 50
-        })
-    except Exception as e:
-        print(f"[SaleVN API] Parse affiliate data error: {e}")
-        return jsonify({'success': False, 'error': f'Parse error: {str(e)}'}), 200
-
-@app.route("/api/orders", methods=["GET"])
-def orders():
-    sub_id = request.args.get('sub_id')
-    if not sub_id: return jsonify({'error': 'Missing sub_id'}), 400
-    qs = urllib.parse.urlencode({
-        'page_size': request.args.get('page_size', '20'),
-        'page_num': request.args.get('page_num', '1'),
-        'sub_id': sub_id,
-        'purchase_time_s': request.args.get('start', ''),
-        'purchase_time_e': request.args.get('end', ''),
-        'version': '1'
-    })
-    cookie = clean_cookie(COOKIE)
-    h = {
-        "content-type": "application/json",
-        "cookie": cookie,
-        "referer": "https://affiliate.shopee.vn/",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    }
-    try:
-        r = requests.get(f"https://affiliate.shopee.vn/api/v3/report/list?{qs}", headers=h, timeout=20)
-        d = r.json()
-        if d.get('code') != 0: return jsonify({'error': 'Shopee error', 'detail': d}), 500
-        lst = (d.get('data') or {}).get('list') or []
-        out = []
-        for o in lst:
-            c = str(o.get('commission', '0'))
-            n = int(re.sub(r"[^\d]", "", c)) if c else 0
-            out.append({
-                'order_sn': o.get('order_sn'),
-                'item_id': o.get('item_id'),
-                'product_name': o.get('product_name', ''),
-                'amount': o.get('amount'),
-                'commission': o.get('commission'),
-                'cashback': f"₫{n//2:,}".replace(',', '.'),
-                'status': o.get('status'),
-                'purchase_time': o.get('purchase_time'),
-                'shop_name': o.get('shop_name', '')
-            })
-        return jsonify({
-            'success': True,
-            'sub_id': sub_id,
-            'page_num': (d.get('data') or {}).get('page_num', 1),
-            'page_size': (d.get('data') or {}).get('page_size', 20),
-            'total_count': (d.get('data') or {}).get('total_count', 0),
-            'orders': out
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route("/", methods=["GET"])
-def health():
-    return "OK", 200
-
-if __name__ == "__main__":
-    app.run(debug=True)
+<script>
+function copyText(id) {
+    const text = document.getElementById(id).innerText;
+    navigator.clipboard.writeText(text).then(() => { alert('Đã copy link!'); });
+}
+</script>
+</body>
+</html>
