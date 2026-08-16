@@ -25,27 +25,21 @@ def extract_ids(url):
     if m: return m.group(1), m.group(2)
     return None, None
 
-def get_product(shopid, itemid):
+def parse_vnd_number(vnd_str):
+    """Chuyển '₫16.200' hoặc '16200' thành int 16200"""
+    if not vnd_str:
+        return 0
     try:
-        r = requests.get(
-            f"https://shopee.vn/api/v4/item/get?itemid={itemid}&shopid={shopid}",
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json',
-                'Referer': f'https://shopee.vn/product/{shopid}/{itemid}'
-            }, timeout=10)
-        d = r.json()
-        if not d.get('data') or not d['data'].get('item'):
-            return None
-        item = d['data']['item']
-        p = item.get('price', 0)
-        try:
-            price = f"₫{int(p)/100000:,.0f}".replace(',', '.')
-        except:
-            price = ''
-        return {'name': item.get('name', 'Sản phẩm'), 'image': item.get('image', ''), 'price': price, 'raw_price': int(p) if p else 0}
+        return int(re.sub(r"[^\d]", "", str(vnd_str)))
     except:
-        return None
+        return 0
+
+def format_vnd(num):
+    """Chuyển 16200 thành '₫16.200'"""
+    try:
+        return f"₫{int(num):,}".replace(',', '.')
+    except:
+        return "₫0"
 
 @app.route("/api/convert", methods=["POST"])
 def convert():
@@ -79,34 +73,73 @@ def convert():
 
 @app.route("/api/commission", methods=["GET"])
 def commission():
-    raw_url = request.args.get('url', '')
-    resolved = resolve_url(raw_url) if ('s.shopee.vn' in raw_url or 'shp.ee' in raw_url) else raw_url
-    shopid, itemid = extract_ids(resolved)
-    if not itemid:
-        return jsonify({'success': False, 'debug': 'Cannot extract IDs'}), 200
-    if not shopid:
-        return jsonify({'success': False, 'debug': 'Missing shopid'}), 200
-    
-    info = get_product(shopid, itemid)
-    if not info:
-        return jsonify({'success': False, 'debug': 'Public API failed'}), 200
-    
-    # Tính ước tính: giả định hoa hồng người bán ~5% giá bán, user nhận 50% = 2.5%
-    price = info['raw_price']
-    comm = int(price * 0.05 / 100000)  # 5% hoa hồng
-    cashback = comm // 2  # user 50%
-    
-    return jsonify({
-        'success': True,
-        'item_id': itemid,
-        'product_name': info['name'],
-        'image': info['image'],
-        'price': info['price'],
-        'seller_commission_rate': '~5%',
-        'estimated_commission': f"₫{comm:,}".replace(',', '.'),
-        'estimated_cashback': f"₫{cashback:,}".replace(',', '.'),
-        'cashback_percent': 50
-    })
+    item_id = request.args.get('item_id', '')
+    if not item_id:
+        return jsonify({'success': False, 'error': 'Missing item_id'}), 400
+
+    cookie = clean_cookie(COOKIE)
+    if not cookie:
+        return jsonify({'success': False, 'error': 'No cookie'}), 500
+
+    try:
+        h = {
+            "content-type": "application/json",
+            "cookie": cookie,
+            "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        }
+        # Gọi API affiliate lấy thông tin hoa hồng thực tế
+        r = requests.get(
+            f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}",
+            headers=h, timeout=20
+        )
+        d = r.json()
+
+        if d.get('code') != 0:
+            return jsonify({'success': False, 'error': 'Shopee API error', 'detail': d}), 500
+
+        data = d.get('data', {})
+        item = data.get('batch_item_for_item_card_full', {})
+
+        # 1. Tên & ảnh sản phẩm
+        product_name = item.get('name', 'Sản phẩm Shopee')
+        image = item.get('image', '')
+
+        # 2. Giá bán (đơn vị trong response là *100.000 VND)
+        raw_price = item.get('price', '0')
+        try:
+            price_val = int(raw_price) / 100000
+            price_str = f"₫{price_val:,.0f}".replace(',', '.')
+        except Exception:
+            price_str = ''
+            price_val = 0
+
+        # 3. Hoa hồng người bán thực tế
+        comm_rate = data.get('commission_rate', {})
+        # Ưu tiên seller_commission, fallback về data.commission
+        seller_commission_str = comm_rate.get('seller_commission') or data.get('commission', '₫0')
+        seller_commission_num = parse_vnd_number(seller_commission_str)
+
+        # 4. Tỷ lệ % người bán trả
+        seller_rate = comm_rate.get('seller_commission_rate', '~5%')
+
+        # 5. Tính hoàn tiền cho user = 50% hoa hồng người bán
+        cashback_num = seller_commission_num // 2
+        cashback_str = format_vnd(cashback_num)
+
+        return jsonify({
+            'success': True,
+            'item_id': item_id,
+            'product_name': product_name,
+            'image': image,
+            'price': price_str,
+            'seller_commission_rate': seller_rate,
+            'estimated_commission': seller_commission_str,   # Hoa hồng gốc Shopee trả
+            'estimated_cashback': cashback_str,              # User nhận 50%
+            'cashback_percent': 50
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route("/api/orders", methods=["GET"])
 def orders():
@@ -131,8 +164,25 @@ def orders():
         for o in lst:
             c = str(o.get('commission', '0'))
             n = int(re.sub(r"[^\d]", "", c)) if c else 0
-            out.append({'order_sn': o.get('order_sn'), 'item_id': o.get('item_id'), 'product_name': o.get('product_name', ''), 'amount': o.get('amount'), 'commission': o.get('commission'), 'cashback': f"₫{n//2:,}".replace(',', '.'), 'status': o.get('status'), 'purchase_time': o.get('purchase_time'), 'shop_name': o.get('shop_name', '')})
-        return jsonify({'success': True, 'sub_id': sub_id, 'page_num': (d.get('data') or {}).get('page_num', 1), 'page_size': (d.get('data') or {}).get('page_size', 20), 'total_count': (d.get('data') or {}).get('total_count', 0), 'orders': out})
+            out.append({
+                'order_sn': o.get('order_sn'),
+                'item_id': o.get('item_id'),
+                'product_name': o.get('product_name', ''),
+                'amount': o.get('amount'),
+                'commission': o.get('commission'),
+                'cashback': f"₫{n//2:,}".replace(',', '.'),
+                'status': o.get('status'),
+                'purchase_time': o.get('purchase_time'),
+                'shop_name': o.get('shop_name', '')
+            })
+        return jsonify({
+            'success': True,
+            'sub_id': sub_id,
+            'page_num': (d.get('data') or {}).get('page_num', 1),
+            'page_size': (d.get('data') or {}).get('page_size', 20),
+            'total_count': (d.get('data') or {}).get('total_count', 0),
+            'orders': out
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
