@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from datetime import datetime
+import time
 import os, json, re, urllib.parse, requests
 
 app = Flask(__name__)
@@ -32,84 +33,17 @@ def extract_ids(url):
     return None, None
 
 def format_money(num):
-    """Format VNĐ thực (vd: 175000 → ₫175.000)"""
     try:
         return f"₫{int(num):,}".replace(',', '.')
     except:
         return "₫0"
 
 def format_shopee_money(num):
-    """Format đơn vị Shopee (×100000) → VNĐ thực (vd: 796000000 → ₫7.960)"""
     try:
         vnd = int(num) / 100000
         return f"₫{int(vnd):,}".replace(',', '.')
     except:
         return "₫0"
-
-# =============  test xong xóa 
-@app.route("/api/test-report", methods=["GET"])
-def test_report():
-    """Test thẳng API report/list của Shopee"""
-    cookie = clean_cookie(COOKIE)
-    if not cookie:
-        return jsonify({'alive': False, 'error': 'Chua co SHOPEE_COOKIE trong env'}), 200
-    
-    sub_id = request.args.get('sub_id', 'addsub')
-    end = int(time.time())
-    start = end - (7 * 24 * 3600)
-    
-    qs = urllib.parse.urlencode({
-        'page_size': '20',
-        'page_num': '1',
-        'sub_id': sub_id,
-        'purchase_time_s': start,
-        'purchase_time_e': end,
-        'version': '1'
-    })
-    
-    h = {
-        "content-type": "application/json",
-        "cookie": cookie,
-        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
-    }
-    
-    try:
-        r = requests.get(f"https://affiliate.shopee.vn/api/v3/report/list?{qs}", headers=h, timeout=15)
-        data = r.json()
-        
-        shopee_code = data.get('code')
-        total = (data.get('data') or {}).get('total_count', 0)
-        lst = (data.get('data') or {}).get('list')
-        
-        if shopee_code == 0 and total > 0:
-            return jsonify({
-                'alive': True,
-                'http_code': r.status_code,
-                'shopee_code': shopee_code,
-                'total_checkouts': total,
-                'message': f'API hoat dong. Co {total} checkout.',
-                'sample': lst[0] if lst else None
-            })
-        elif shopee_code == 0:
-            return jsonify({
-                'alive': True,
-                'http_code': r.status_code,
-                'shopee_code': shopee_code,
-                'total_checkouts': 0,
-                'message': 'API hoat dong nhung khong co don hang (sub_id nay chua co don hoac sai thoi gian).'
-            })
-        else:
-            return jsonify({
-                'alive': False,
-                'http_code': r.status_code,
-                'shopee_code': shopee_code,
-                'message': f'Cookie het han hoac bi chan. Code: {shopee_code}',
-                'raw': data
-            })
-    except Exception as e:
-        return jsonify({'alive': False, 'error': str(e)}), 200
-        
-# =============  
 
 @app.route("/api/convert", methods=["POST"])
 def convert():
@@ -238,14 +172,12 @@ def orders():
         
         out = []
         for checkout in checkout_list:
-            # Commission tổng của cả checkout (đơn vị ×100000)
             net_comm_str = str(checkout.get('affiliate_net_commission') or '0')
             try:
                 net_comm = int(float(net_comm_str))
             except:
                 net_comm = 0
             
-            # Đếm tổng số items để chia đều commission
             total_items = 0
             for order in (checkout.get('orders') or []):
                 total_items += len(order.get('items') or [])
@@ -253,11 +185,9 @@ def orders():
             comm_per_item = net_comm // total_items if total_items > 0 else 0
             remainder = net_comm - (comm_per_item * total_items)
             
-            # Map status ở checkout level
             checkout_status = checkout.get('checkout_status', '')
             conversion_status = checkout.get('conversion_status', 1)
             
-            # Convert timestamp
             purchase_ts = checkout.get('purchase_time', 0)
             purchase_dt = ''
             if purchase_ts:
@@ -271,7 +201,6 @@ def orders():
                 order_sn = order.get('order_sn', '')
                 order_status = order.get('order_status', '')
                 
-                # Map status chi tiết
                 if order_status == 'CANCEL' or checkout_status == 'Invalid' or conversion_status == 3:
                     mapped_status = 'cancelled'
                 elif order_status == 'COMPLETED' or conversion_status == 2:
@@ -280,14 +209,11 @@ def orders():
                     mapped_status = 'pending'
                 
                 for item in (order.get('items') or []):
-                    # Item đầu tiên nhận thêm phần dư chia không hết
                     item_comm = comm_per_item + (1 if item_idx == 0 and remainder > 0 else 0)
                     item_idx += 1
                     
-                    # User nhận 50% commission thực tế
                     user_cashback = item_comm // 2
                     
-                    # Giá: actual_amount (thanh toán thực tế) hoặc item_price
                     actual = item.get('actual_amount', 0)
                     price = item.get('item_price', 0)
                     amount_val = actual if actual else price
@@ -315,6 +241,83 @@ def orders():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route("/api/test-report", methods=["GET"])
+def test_report():
+    """Test thẳng API report/list của Shopee - tra ve JSON ro rang, khong 500"""
+    try:
+        cookie = clean_cookie(COOKIE)
+        if not cookie:
+            return jsonify({
+                'alive': False,
+                'error': 'Chua co SHOPEE_COOKIE trong env Vercel'
+            }), 200
+        
+        sub_id = request.args.get('sub_id', 'addsub')
+        end = int(time.time())
+        start = end - (7 * 24 * 3600)
+        
+        qs = urllib.parse.urlencode({
+            'page_size': '20',
+            'page_num': '1',
+            'sub_id': sub_id,
+            'purchase_time_s': start,
+            'purchase_time_e': end,
+            'version': '1'
+        })
+        
+        h = {
+            "content-type": "application/json",
+            "cookie": cookie,
+            "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+        }
+        
+        r = requests.get(f"https://affiliate.shopee.vn/api/v3/report/list?{qs}", headers=h, timeout=15)
+        
+        try:
+            data = r.json()
+        except Exception:
+            return jsonify({
+                'alive': False,
+                'error': 'Shopee tra ve khong phai JSON',
+                'raw_status': r.status_code,
+                'raw_body': r.text[:500]
+            }), 200
+        
+        shopee_code = data.get('code')
+        total = (data.get('data') or {}).get('total_count', 0)
+        lst = (data.get('data') or {}).get('list')
+        
+        if shopee_code == 0 and total > 0:
+            return jsonify({
+                'alive': True,
+                'http_code': r.status_code,
+                'shopee_code': shopee_code,
+                'total_checkouts': total,
+                'message': f'API hoat dong. Co {total} checkout.',
+                'sample': lst[0] if lst else None
+            })
+        elif shopee_code == 0:
+            return jsonify({
+                'alive': True,
+                'http_code': r.status_code,
+                'shopee_code': shopee_code,
+                'total_checkouts': 0,
+                'message': 'API hoat dong nhung khong co don hang (sub_id chua co don hoac sai thoi gian).'
+            })
+        else:
+            return jsonify({
+                'alive': False,
+                'http_code': r.status_code,
+                'shopee_code': shopee_code,
+                'message': f'Cookie het han hoac bi chan. Code: {shopee_code}',
+                'raw': data
+            })
+    except Exception as e:
+        return jsonify({
+            'alive': False,
+            'error': f'Exception: {str(e)}'
+        }), 200
 
 @app.route("/", methods=["GET"])
 def health():
