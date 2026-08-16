@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from datetime import datetime
 import os, json, re, urllib.parse, requests
 
 app = Flask(__name__)
@@ -8,7 +9,6 @@ def clean_cookie(raw):
     return (raw or "").replace('"', "").replace("'", "").strip()
 
 def resolve_url(url):
-    """Resolve link rút gọn → link đích (follow HTTP redirect)"""
     try:
         if not url.startswith('http'):
             url = 'https://' + url
@@ -32,8 +32,17 @@ def extract_ids(url):
     return None, None
 
 def format_money(num):
+    """Format VNĐ thực (vd: 175000 → ₫175.000)"""
     try:
         return f"₫{int(num):,}".replace(',', '.')
+    except:
+        return "₫0"
+
+def format_shopee_money(num):
+    """Format đơn vị Shopee (×100000) → VNĐ thực (vd: 796000000 → ₫7.960)"""
+    try:
+        vnd = int(num) / 100000
+        return f"₫{int(vnd):,}".replace(',', '.')
     except:
         return "₫0"
 
@@ -76,7 +85,6 @@ def commission():
     raw_url = request.args.get('url', '')
     item_id = request.args.get('item_id', '')
     
-    # Nếu không có item_id, resolve URL rút gọn rồi extract
     if not item_id:
         is_short = any(x in raw_url for x in ['s.shopee.vn', 'shp.ee', 'vn.shp.ee'])
         resolved = resolve_url(raw_url) if is_short else raw_url
@@ -87,7 +95,6 @@ def commission():
         return jsonify({'success': False, 'debug': 'Cannot extract item_id from URL'}), 200
     
     try:
-        # Dùng API addlivetag.com (không cần cookie Shopee)
         r = requests.get(
             f"https://data.addlivetag.com/product-data/product-data.php?item_id={item_id}",
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
@@ -103,16 +110,14 @@ def commission():
             return jsonify({'success': False, 'debug': 'Empty productInfo'}), 200
         
         product_name = info.get('productName', 'Sản phẩm Shopee')
-        image = info.get('imageUrl', '')  # URL đầy đủ từ addlivetag
+        image = info.get('imageUrl', '')
         price_val = info.get('price', 0)
         price_str = format_money(price_val) if price_val else ''
         
-        # Hoa hồng người bán (Xtra) — không giới hạn trần
         seller_com = info.get('sellerComFinal', 0)
         if seller_com is None or not info.get('hasSellerCommission', False):
             seller_com = 0
         
-        # Chia đôi 50/50
         user_cashback = seller_com // 2
         platform_fee = seller_com - user_cashback
         
@@ -142,6 +147,7 @@ def commission():
 def orders():
     sub_id = request.args.get('sub_id')
     if not sub_id: return jsonify({'error': 'Missing sub_id'}), 400
+    
     qs = urllib.parse.urlencode({
         'page_size': request.args.get('page_size', '20'),
         'page_num': request.args.get('page_num', '1'),
@@ -159,29 +165,87 @@ def orders():
     try:
         r = requests.get(f"https://affiliate.shopee.vn/api/v3/report/list?{qs}", headers=h, timeout=20)
         d = r.json()
-        if d.get('code') != 0: return jsonify({'error': 'Shopee error', 'detail': d}), 500
-        lst = (d.get('data') or {}).get('list') or []
+        if d.get('code') != 0:
+            return jsonify({'error': 'Shopee error', 'detail': d}), 500
+        
+        data = d.get('data') or {}
+        checkout_list = data.get('list') or []
+        
         out = []
-        for o in lst:
-            c = str(o.get('commission', '0'))
-            n = int(re.sub(r"[^\d]", "", c)) if c else 0
-            out.append({
-                'order_sn': o.get('order_sn'),
-                'item_id': o.get('item_id'),
-                'product_name': o.get('product_name', ''),
-                'amount': o.get('amount'),
-                'commission': o.get('commission'),
-                'cashback': format_money(n // 2),
-                'status': o.get('status'),
-                'purchase_time': o.get('purchase_time'),
-                'shop_name': o.get('shop_name', '')
-            })
+        for checkout in checkout_list:
+            # Commission tổng của cả checkout (đơn vị ×100000)
+            net_comm_str = str(checkout.get('affiliate_net_commission') or '0')
+            try:
+                net_comm = int(float(net_comm_str))
+            except:
+                net_comm = 0
+            
+            # Đếm tổng số items để chia đều commission
+            total_items = 0
+            for order in (checkout.get('orders') or []):
+                total_items += len(order.get('items') or [])
+            
+            comm_per_item = net_comm // total_items if total_items > 0 else 0
+            remainder = net_comm - (comm_per_item * total_items)
+            
+            # Map status ở checkout level
+            checkout_status = checkout.get('checkout_status', '')
+            conversion_status = checkout.get('conversion_status', 1)
+            
+            # Convert timestamp
+            purchase_ts = checkout.get('purchase_time', 0)
+            purchase_dt = ''
+            if purchase_ts:
+                try:
+                    purchase_dt = datetime.fromtimestamp(purchase_ts).strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    purchase_dt = ''
+            
+            item_idx = 0
+            for order in (checkout.get('orders') or []):
+                order_sn = order.get('order_sn', '')
+                order_status = order.get('order_status', '')
+                
+                # Map status chi tiết
+                if order_status == 'CANCEL' or checkout_status == 'Invalid' or conversion_status == 3:
+                    mapped_status = 'cancelled'
+                elif order_status == 'COMPLETED' or conversion_status == 2:
+                    mapped_status = 'confirmed'
+                else:
+                    mapped_status = 'pending'
+                
+                for item in (order.get('items') or []):
+                    # Item đầu tiên nhận thêm phần dư chia không hết
+                    item_comm = comm_per_item + (1 if item_idx == 0 and remainder > 0 else 0)
+                    item_idx += 1
+                    
+                    # User nhận 50% commission thực tế
+                    user_cashback = item_comm // 2
+                    
+                    # Giá: actual_amount (thanh toán thực tế) hoặc item_price
+                    actual = item.get('actual_amount', 0)
+                    price = item.get('item_price', 0)
+                    amount_val = actual if actual else price
+                    
+                    out.append({
+                        'order_sn': order_sn,
+                        'item_id': str(item.get('item_id', '')),
+                        'product_name': item.get('item_name', ''),
+                        'amount': format_shopee_money(amount_val),
+                        'commission': format_shopee_money(item_comm),
+                        'cashback': format_shopee_money(user_cashback),
+                        'status': mapped_status,
+                        'purchase_time': purchase_dt,
+                        'shop_name': item.get('shop_name', ''),
+                        'image': item.get('img_code', '')
+                    })
+        
         return jsonify({
             'success': True,
             'sub_id': sub_id,
-            'page_num': (d.get('data') or {}).get('page_num', 1),
-            'page_size': (d.get('data') or {}).get('page_size', 20),
-            'total_count': (d.get('data') or {}).get('total_count', 0),
+            'page_num': data.get('page_num', 1),
+            'page_size': data.get('page_size', 20),
+            'total_count': data.get('total_count', 0),
             'orders': out
         })
     except Exception as e:
