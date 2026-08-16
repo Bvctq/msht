@@ -1,13 +1,5 @@
 {
-  "name": "shopee-cashback-api",
+  "name": "shopee-api",
   "version": "1.0.0",
-  "description": "Shopee Affiliate Cashback API",
-  "main": "api/convert.js",
-  "scripts": {
-    "dev": "vercel dev"
-  },
-  "dependencies": {},
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "engines": { "node": ">=18" }
 }
