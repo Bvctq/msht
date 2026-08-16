@@ -88,9 +88,10 @@ def api_commission():
     if auth_error:
         return auth_error
 
-    item_id = request.args.get('item_id')
-    purl = request.args.get('url')
+    item_id = request.args.get('item_id', '').strip()
+    purl = request.args.get('url', '')
 
+    # Nếu không có item_id, parse từ url
     if not item_id and purl:
         m = re.search(r'product\/(\d+)\/(\d+)', purl)
         if m:
@@ -105,7 +106,10 @@ def api_commission():
                     item_id = m.group(2)
 
     if not item_id:
-        return jsonify({'success': False, 'debug': 'Missing item_id or url'}), 200
+        return jsonify({
+            'success': False,
+            'debug': 'Cannot extract item_id from url. Please use full shopee.vn product link.'
+        }), 200
 
     cookie = clean_cookie(SHOPEE_COOKIE)
     headers = {
