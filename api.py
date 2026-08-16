@@ -5,6 +5,105 @@ import re
 import urllib.parse
 import requests
 
+
+# Cập nhật hàm giải mã link ngắn Shopee ở đầu file hoặc trong phần HELPERS
+def unshorten_shopee_url(url):
+    if not url:
+        return url
+    if 's.shopee.vn' in url or 'shp.ee' in url or 'shopee.ee' in url:
+        try:
+            resp = requests.head(url, allow_redirects=True, timeout=10, headers={'User-Agent': USER_AGENT})
+            return resp.url
+        except Exception as e:
+            print(f"Unshorten Shopee error: {e}")
+    return url
+
+
+@app.route("/api/commission", methods=["GET"])
+def api_commission():
+    auth_error = require_auth()
+    if auth_error:
+        return auth_error
+
+    item_id = request.args.get('item_id')
+    purl = request.args.get('url')
+
+    # 1. Giải mã link ngắn & Bóc tách item_id nếu chưa có
+    if not item_id and purl:
+        resolved_url = unshorten_shopee_url(purl)
+        
+        m = re.search(r'product\/(\d+)\/(\d+)', resolved_url) or \
+            re.search(r'-i\.(\d+)\.(\d+)', resolved_url) or \
+            re.search(r'i\.(\d+)\.(\d+)', resolved_url) or \
+            re.search(r'[?&]item_id=(\d+)', resolved_url)
+            
+        if m:
+            item_id = m.group(m.lastindex)
+
+    if not item_id:
+        return jsonify({'error': 'Không trích xuất được item_id từ URL'}), 400
+
+    cookie_val = clean_cookie(SHOPEE_COOKIE)
+    if not cookie_val:
+        return jsonify({'error': 'Chưa cấu hình SHOPEE_COOKIE trên Vercel'}), 500
+
+    headers = {
+        "content-type": "application/json",
+        "cookie": cookie_val,
+        "user-agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        ),
+    }
+
+    try:
+        resp = requests.get(
+            f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}",
+            headers=headers,
+            timeout=20,
+        )
+        data = resp.json()
+        if data.get("code") != 0 or not data.get("data"):
+            return jsonify({'error': 'Lỗi Shopee API hoặc Cookie hết hạn', 'detail': data}), 500
+
+        d = data["data"]
+        comm_rate_info = d.get("commission_rate", {})
+        
+        # ===== LOGIC TÍNH HOA HỒNG NGƯỜI BÁN & CHIA 50/50 =====
+        # Lấy hoa hồng người bán trả (seller_commission)
+        seller_comm_str = comm_rate_info.get("seller_commission") or d.get("commission", "0")
+        rate_str = comm_rate_info.get("seller_commission_rate", "0%")
+        
+        # Bóc tách số tiền nguyên (VND)
+        comm_num = int(re.sub(r"[^\d]", "", seller_comm_str)) if seller_comm_str else 0
+        
+        # Chia 50% cho người dùng, 50% giữ lại
+        user_cashback_num = comm_num // 2  
+
+        product_info = d.get("batch_item_for_item_card_full", {}) or {}
+        
+        # Giá Shopee trả về dạng số nhân 100.000 (vd: 18000000000 = 180.000đ)
+        price_raw = product_info.get("price", "0")
+        try:
+            price_num = int(price_raw) / 100000
+            price_str = f"₫{int(price_num):,}".replace(",", ".")
+        except:
+            price_str = ""
+
+        return jsonify({
+            'success': True,
+            'item_id': item_id,
+            'product_name': product_info.get("name", "Sản phẩm Shopee"),
+            'image': product_info.get("image", ""),
+            'price': price_str,
+            'seller_commission_rate': rate_str,
+            'total_seller_commission': f"₫{comm_num:,}".replace(",", "."),
+            'estimated_cashback': f"₫{user_cashback_num:,}".replace(",", "."),
+            'cashback_percent': 50,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+        
 app = Flask(__name__)
 
 INTERNAL_API_KEY = os.environ.get("INTERNAL_API_KEY", "")
