@@ -43,22 +43,13 @@ def api_convert():
 
     payload = {
         "operationName": "batchGetCustomLink",
-        "query": (
-            "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){"
-            "batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){shortLink longLink failCode}}"
-        ),
-        "variables": {
-            "linkParams": link_params,
-            "sourceCaller": "CUSTOM_LINK_CALLER",
-        },
+        "query": "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){shortLink longLink failCode}}",
+        "variables": {"linkParams": link_params, "sourceCaller": "CUSTOM_LINK_CALLER"},
     }
     headers = {
         "content-type": "application/json",
         "cookie": cookie,
-        "user-agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        ),
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
     }
     
     try:
@@ -89,7 +80,6 @@ def api_convert():
             'short_link': short_link
         })
     except Exception as e:
-        print(f"[Convert Error] {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route("/api/commission", methods=["GET"])
@@ -115,58 +105,50 @@ def api_commission():
                     item_id = m.group(2)
 
     if not item_id:
-        return jsonify({'error': 'Missing item_id or url'}), 400
+        return jsonify({'success': False, 'debug': 'Missing item_id or url'}), 200
 
     cookie = clean_cookie(SHOPEE_COOKIE)
     headers = {
         "content-type": "application/json",
         "cookie": cookie,
-        "user-agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        ),
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
     }
 
     try:
         url = f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}"
-        print(f"[Commission] Requesting {url}")
-        
         resp = requests.get(url, headers=headers, timeout=20)
-        print(f"[Commission] Status: {resp.status_code}")
-        print(f"[Commission] Content-Type: {resp.headers.get('content-type', 'unknown')}")
+        raw_text = resp.text
         
-        # Nếu Shopee trả HTML (cookie hết hạn), báo lỗi rõ
-        if 'text/html' in resp.headers.get('content-type', ''):
-            print(f"[Commission] HTML response (cookie expired?)")
-            return jsonify({'error': 'Shopee returned HTML - cookie may be expired'}), 500
-        
-        # Thử parse JSON
         try:
             data = resp.json()
-        except Exception as je:
-            print(f"[Commission] JSON parse error: {je}")
-            print(f"[Commission] Raw text: {resp.text[:500]}")
-            return jsonify({'error': 'Invalid JSON from Shopee', 'raw_preview': resp.text[:200]}), 500
-        
-        print(f"[Commission] Response code: {data.get('code')}")
+        except Exception:
+            return jsonify({
+                'success': False,
+                'debug': 'Shopee returned non-JSON (cookie expired?)',
+                'http_status': resp.status_code,
+                'content_type': resp.headers.get('content-type'),
+                'raw_preview': raw_text[:500]
+            }), 200
         
         code = data.get("code")
         if code != 0:
             return jsonify({
-                'error': 'Shopee API error', 
+                'success': False,
+                'debug': 'Shopee API error code',
                 'shopee_code': code,
-                'shopee_msg': data.get('msg', 'unknown'),
-                'detail': data
-            }), 500
+                'shopee_msg': data.get('msg'),
+                'full_response': data
+            }), 200
         
         d = data.get("data")
         if not d:
-            return jsonify({'error': 'Empty data from Shopee'}), 500
+            return jsonify({
+                'success': False,
+                'debug': 'Shopee data is empty',
+                'full_response': data
+            }), 200
 
-        # Lấy hoa hồng người bán
         comm_rate = d.get("commission_rate") or {}
-        
-        # Ưu tiên seller_commission, fallback về commission
         seller_comm_raw = comm_rate.get("seller_commission")
         if seller_comm_raw is None:
             seller_comm_raw = d.get("commission", "0")
@@ -174,14 +156,12 @@ def api_commission():
         seller_comm_str = str(seller_comm_raw or "0")
         rate_str = str(comm_rate.get("seller_commission_rate", "0%") if comm_rate else "0%")
         
-        # Parse số tiền
         comm_clean = re.sub(r"[^\d]", "", seller_comm_str)
         comm_num = int(comm_clean) if comm_clean else 0
         cashback = comm_num // 2
 
         product_info = d.get("batch_item_for_item_card_full") or {}
         
-        # Giá Shopee trả về *100000
         price_raw = product_info.get("price", "0")
         try:
             price_num = int(price_raw) / 100000
@@ -201,8 +181,12 @@ def api_commission():
             'cashback_percent': 50,
         })
     except Exception as e:
-        print(f"[Commission Exception] {type(e).__name__}: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'success': False,
+            'debug': 'Python exception',
+            'error_type': type(e).__name__,
+            'error_msg': str(e)
+        }), 200
 
 @app.route("/api/orders", methods=["GET"])
 def api_orders():
@@ -232,10 +216,7 @@ def api_orders():
     headers = {
         "content-type": "application/json",
         "cookie": cookie,
-        "user-agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-        ),
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
     }
 
     try:
@@ -275,7 +256,6 @@ def api_orders():
             'orders': orders
         })
     except Exception as e:
-        print(f"[Orders Exception] {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route("/", methods=["GET"])
