@@ -1,6 +1,9 @@
 {
   "version": 2,
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index_debug.js" }
+  "builds": [
+    { "src": "api.py", "use": "@vercel/python" }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "api.py" }
   ]
 }
