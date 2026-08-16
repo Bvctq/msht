@@ -206,7 +206,7 @@ def api_commission():
 
     shopee_cookie = clean_cookie(SHOPEE_COOKIE)
     if not shopee_cookie:
-        return jsonify({'error': 'Thiếu SHOPEE_COOKIE'}), 500
+        return jsonify({'error': 'Biến SHOPEE_COOKIE trên Vercel đang bị rỗng'}), 500
 
     headers = {
         "content-type": "application/json",
@@ -224,21 +224,20 @@ def api_commission():
             timeout=20,
         )
 
-        # Chống crash khi Shopee trả về HTML/403 thay vì JSON
         try:
             data = resp.json()
         except Exception:
             return jsonify({
-                'error': 'Shopee chặn IP Vercel hoặc Cookie sai cấu trúc',
-                'http_status': resp.status_code,
-                'response_preview': resp.text[:300]
+                'error': 'Shopee trả về nội dung không phải JSON',
+                'status_code': resp.status_code,
+                'preview': resp.text[:200]
             }), 400
 
+        # Nếu Shopee trả lỗi hoặc không có data, in nguyên văn JSON từ Shopee ra để debug
         if data.get("code") != 0 or not data.get("data"):
             return jsonify({
-                'error': 'Shopee từ chối request (Cookie hết hạn hoặc không có quyền)',
-                'shopee_code': data.get("code"),
-                'shopee_msg': data.get("message") or data.get("msg")
+                'error': 'Shopee từ chối lấy thông tin hoa hồng',
+                'raw_shopee_response': data
             }), 400
 
         d = data.get("data") or {}
