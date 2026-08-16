@@ -1,14 +1,9 @@
-// pages/api/index.js
-// API hoàn tiền Shopee - All-in-one
-
 export default async function handler(req, res) {
-  // --- CORS ---
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-API-Secret');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // --- Auth (tùy chọn) ---
   const secret = process.env.API_SECRET;
   if (secret && (req.headers['x-api-secret'] || req.query.secret) !== secret) {
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
@@ -18,75 +13,40 @@ export default async function handler(req, res) {
   const cookie = process.env.SHOPEE_AFFILIATE_COOKIE || '';
 
   try {
-    if (req.method === 'POST' && action === 'link') {
-      return await createLink(req, res, cookie);
-    }
-    if (req.method === 'GET' && action === 'commission') {
-      return await getCommission(req, res, cookie);
-    }
-    if (req.method === 'GET' && action === 'orders') {
-      return await getOrders(req, res, cookie);
-    }
-    return res.status(400).json({ ok: false, error: 'Invalid action. Use ?action=link (POST), ?action=commission (GET), ?action=orders (GET)' });
+    if (req.method === 'POST' && action === 'link') return await createLink(req, res, cookie);
+    if (req.method === 'GET' && action === 'commission') return await getCommission(req, res, cookie);
+    if (req.method === 'GET' && action === 'orders') return await getOrders(req, res, cookie);
+    return res.status(400).json({ ok: false, error: 'Invalid action. Use ?action=link|commission|orders' });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e.message, stack: e.stack });
   }
 }
 
-/* ================= HELPERS ================= */
-
-async function shopeeFetch(path, opts = {}, cookie) {
-  return fetch(`https://affiliate.shopee.vn${path}`, {
-    ...opts,
-    headers: {
-      'Cookie': cookie,
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-      'Accept': 'application/json',
-      ...(opts.headers || {}),
-    },
-  });
+async function shopeeFetch(path, opts, cookie) {
+  const url = `https://affiliate.shopee.vn${path}`;
+  const headers = {
+    'Cookie': cookie,
+    'Content-Type': 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
+    'Referer': 'https://affiliate.shopee.vn/',
+    'Origin': 'https://affiliate.shopee.vn',
+    ...(opts.headers || {}),
+  };
+  
+  const res = await fetch(url, { ...opts, headers });
+  const text = await res.text();
+  
+  // Log để debug trên Vercel dashboard
+  console.log(`[SHOPEE API] ${path} | Status: ${res.status} | Body: ${text.substring(0, 500)}`);
+  
+  let json = null;
+  try { json = JSON.parse(text); } catch(e) {}
+  
+  return { status: res.status, text, json, ok: res.ok };
 }
 
-// Giải mã link rút gọn s.shopee.vn
-async function resolveShortLink(url) {
-  if (!url.includes('s.shopee.vn')) return url;
-  let cur = url;
-  for (let i = 0; i < 5; i++) {
-    const r = await fetch(cur, { redirect: 'manual', headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (r.status >= 300 && r.status < 400) {
-      const loc = r.headers.get('location');
-      if (!loc) break;
-      cur = loc.startsWith('http') ? loc : new URL(loc, cur).href;
-      if (!cur.includes('s.shopee.vn')) return cur;
-    } else break;
-  }
-  return cur;
-}
-
-// Trích item_id, shop_id
-function extractIds(url) {
-  const m = url.match(/shopee\.vn\/(?:universal-link\/)?product\/(\d+)\/(\d+)/);
-  if (m) return { shopId: m[1], itemId: m[2] };
-  const item = url.match(/[?&]item_id=(\d+)/);
-  const shop = url.match(/[?&]shopid=(\d+)/i);
-  return { shopId: shop?.[1] || '', itemId: item?.[1] || '' };
-}
-
-// Parse "₫3.570" → 3570
-function parseVnd(s) {
-  if (!s) return 0;
-  const n = parseInt(String(s).replace(/[₫\s.]/g, '').replace(/,/g, ''), 10);
-  return isNaN(n) ? 0 : n;
-}
-
-function imgUrl(id) {
-  return id ? `https://down-vn.img.susercontent.com/file/${id}` : '';
-}
-
-/* ================= ACTIONS ================= */
-
-// 1. Tạo link affiliate
 async function createLink(req, res, cookie) {
   const { url } = req.body || {};
   if (!url?.includes('shopee.vn')) {
@@ -109,42 +69,85 @@ async function createLink(req, res, cookie) {
   };
 
   const r = await shopeeFetch('/api/v3/gql?q=batchCustomLink', { method: 'POST', body: JSON.stringify(body) }, cookie);
-  const j = await r.json();
-  const item = j?.data?.batchCustomLink?.[0];
+  
+  if (!r.json) {
+    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text.substring(0, 1000) });
+  }
 
-  if (!item || item.failCode !== 0) {
-    return res.status(502).json({ ok: false, error: 'Shopee trả về lỗi', raw: j });
+  const item = r.json?.data?.batchCustomLink?.[0];
+  
+  if (!item) {
+    return res.status(502).json({ ok: false, error: 'Không có dữ liệu batchCustomLink', status: r.status, raw: r.json });
+  }
+
+  if (item.failCode !== 0) {
+    return res.status(400).json({ ok: false, error: `Shopee failCode: ${item.failCode}`, status: r.status, raw: r.json });
   }
 
   return res.json({ ok: true, data: { shortLink: item.shortLink, longLink: item.longLink } });
 }
 
-// 2. Lấy hoa hồng → tính hoàn tiền 50% cho user
+async function resolveShortLink(url) {
+  if (!url.includes('s.shopee.vn')) return url;
+  let cur = url;
+  for (let i = 0; i < 5; i++) {
+    const r = await fetch(cur, { redirect: 'manual', headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (r.status >= 300 && r.status < 400) {
+      const loc = r.headers.get('location');
+      if (!loc) break;
+      cur = loc.startsWith('http') ? loc : new URL(loc, cur).href;
+      if (!cur.includes('s.shopee.vn')) return cur;
+    } else break;
+  }
+  return cur;
+}
+
+function extractIds(url) {
+  const m = url.match(/shopee\.vn\/(?:universal-link\/)?product\/(\d+)\/(\d+)/);
+  if (m) return { shopId: m[1], itemId: m[2] };
+  const item = url.match(/[?&]item_id=(\d+)/);
+  const shop = url.match(/[?&]shopid=(\d+)/i);
+  return { shopId: shop?.[1] || '', itemId: item?.[1] || '' };
+}
+
+function parseVnd(s) {
+  if (!s) return 0;
+  const n = parseInt(String(s).replace(/[₫\s.]/g, '').replace(/,/g, ''), 10);
+  return isNaN(n) ? 0 : n;
+}
+
+function imgUrl(id) {
+  return id ? `https://down-vn.img.susercontent.com/file/${id}` : '';
+}
+
 async function getCommission(req, res, cookie) {
   let { url } = req.query;
   if (!url) return res.status(400).json({ ok: false, error: 'Thiếu ?url=' });
 
   const resolved = await resolveShortLink(url);
   const { itemId, shopId } = extractIds(resolved);
-  if (!itemId) return res.status(400).json({ ok: false, error: 'Không lấy được item_id từ link' });
+  if (!itemId) return res.status(400).json({ ok: false, error: 'Không lấy được item_id từ link', resolved });
 
   const r = await shopeeFetch(`/api/v3/offer/product?item_id=${itemId}`, {}, cookie);
-  const j = await r.json();
+  
+  if (!r.json) {
+    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text?.substring(0, 500) });
+  }
+  
+  const j = r.json;
   if (j.code !== 0 || !j.data) {
-    return res.status(502).json({ ok: false, error: 'Lỗi dữ liệu Shopee', raw: j });
+    return res.status(502).json({ ok: false, error: 'Lỗi dữ liệu Shopee', status: r.status, raw: j });
   }
 
   const item = j.data.batch_item_for_item_card_full || {};
   const rateInfo = j.data.commission_rate || {};
   const rateDetail = j.data.commission_rate_detail || {};
 
-  // Giá Shopee nhân 100000
   const priceVnd = parseInt(item.price || item.price_min || '0', 10) / 100000;
-
-  // Ưu tiên lấy seller_commission đã tính sẵn, nếu không thì tính từ rate
   let sellerComm = parseVnd(rateInfo.seller_commission);
+  
   if (!sellerComm && rateDetail.seller_commission_rate) {
-    const rate = parseInt(rateDetail.seller_commission_rate, 10) / 100000; // 21000 = 21%
+    const rate = parseInt(rateDetail.seller_commission_rate, 10) / 100000;
     sellerComm = Math.round(priceVnd * rate);
   }
 
@@ -160,14 +163,13 @@ async function getCommission(req, res, cookie) {
       image: imgUrl(item.image),
       price: Math.round(priceVnd),
       discount: item.discount || '',
-      seller_commission: sellerComm,   // Tổng hoa hồng người bán
-      user_cashback: userCashback,     // User được hoàn (50%)
-      platform_keep: platformKeep,     // Hệ thống giữ (50%)
+      seller_commission: sellerComm,
+      user_cashback: userCashback,
+      platform_keep: platformKeep,
     }
   });
 }
 
-// 3. Lấy đơn hàng theo sub_id
 async function getOrders(req, res, cookie) {
   const { sub_id, page_num = 1, page_size = 20, purchase_time_s, purchase_time_e, version = 1 } = req.query;
   if (!sub_id) return res.status(400).json({ ok: false, error: 'Thiếu ?sub_id=' });
@@ -181,7 +183,10 @@ async function getOrders(req, res, cookie) {
   if (purchase_time_e) qs.set('purchase_time_e', purchase_time_e);
 
   const r = await shopeeFetch(`/api/v3/offer/orders?${qs.toString()}`, {}, cookie);
-  const j = await r.json();
-
-  return res.json({ ok: j.code === 0, data: j.data || null, msg: j.msg, raw: j });
+  
+  if (!r.json) {
+    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text?.substring(0, 500) });
+  }
+  
+  return res.json({ ok: r.json.code === 0, data: r.json.data || null, msg: r.json.msg, raw: r.json });
 }
