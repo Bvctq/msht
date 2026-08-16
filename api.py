@@ -7,7 +7,42 @@ COOKIE = os.environ.get("SHOPEE_COOKIE", "")
 def clean_cookie(raw):
     return (raw or "").replace('"', "").replace("'", "").strip()
 
-# ========== CONVERT ==========
+def resolve_url(url):
+    """Follow redirect để lấy URL đích từ link rút gọn"""
+    try:
+        h = {
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        r = requests.get(url, headers=h, timeout=10, allow_redirects=True)
+        return r.url
+    except:
+        return url
+
+def get_public_product(shopid, itemid):
+    """Dùng API công khai Shopee khi cookie affiliate chết"""
+    try:
+        url = f"https://shopee.vn/api/v4/item/get?itemid={itemid}&shopid={shopid}"
+        h = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'application/json'}
+        r = requests.get(url, headers=h, timeout=10)
+        d = r.json()
+        if d.get('error') or not d.get('data'):
+            return None
+        item = d['data'].get('item') or {}
+        price = item.get('price', 0)
+        try:
+            price_str = f"₫{int(price)/100000:,.0f}".replace(',', '.')
+        except:
+            price_str = ''
+        return {
+            'product_name': item.get('name', 'Sản phẩm Shopee'),
+            'image': item.get('image', ''),
+            'price': price_str,
+            'fallback': True
+        }
+    except:
+        return None
+
 @app.route("/api/convert", methods=["POST"])
 def convert():
     data = request.get_json() or {}
@@ -15,26 +50,19 @@ def convert():
     sub = data.get('sub_id', '')
     if not url:
         return jsonify({'error': 'Missing url'}), 400
-
     cookie = clean_cookie(COOKIE)
     if not cookie:
         return jsonify({'error': 'No Shopee cookie configured'}), 500
-
     api_url = url if url.startswith('http') else 'https://' + url
     lp = [{"originalLink": api_url}]
     if sub:
         lp[0]["advancedLinkParams"] = {"subId1": str(sub)}
-
     payload = {
         "operationName": "batchGetCustomLink",
         "query": "query batchGetCustomLink($linkParams: [CustomLinkParam!], $sourceCaller: SourceCaller){batchCustomLink(linkParams: $linkParams, sourceCaller: $sourceCaller){shortLink longLink failCode}}",
         "variables": {"linkParams": lp, "sourceCaller": "CUSTOM_LINK_CALLER"}
     }
-    h = {
-        "content-type": "application/json",
-        "cookie": cookie,
-        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-    }
+    h = {"content-type": "application/json", "cookie": cookie, "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"}
     try:
         r = requests.post("https://affiliate.shopee.vn/api/v3/gql?q=batchCustomLink", headers=h, json=payload, timeout=20)
         d = r.json()
@@ -51,21 +79,39 @@ def convert():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ========== COMMISSION ==========
 @app.route("/api/commission", methods=["GET"])
 def commission():
     item_id = request.args.get('item_id', '').strip()
     purl = request.args.get('url', '')
 
+    # Resolve link rút gọn
+    if purl and ('s.shopee.vn' in purl or 'shp.ee' in purl):
+        purl = resolve_url(purl if purl.startswith('http') else 'https://' + purl)
+
+    # Parse item_id + shopid
+    shopid = None
     if not item_id and purl:
-        for pat in [r'product\/(\d+)\/(\d+)', r'[?&]item_id=(\d+)', r'-i\.(\d+)\.(\d+)']:
-            m = re.search(pat, purl)
+        m = re.search(r'product\/(\d+)\/(\d+)', purl)
+        if m:
+            shopid = m.group(1)
+            item_id = m.group(2)
+        else:
+            m = re.search(r'[?&]item_id=(\d+)', purl)
             if m:
-                item_id = m.group(2) if len(m.groups()) > 1 else m.group(1)
-                break
+                item_id = m.group(1)
+            else:
+                m = re.search(r'-i\.(\d+)\.(\d+)', purl)
+                if m:
+                    shopid = m.group(1)
+                    item_id = m.group(2)
 
     if not item_id:
-        return jsonify({'success': False, 'debug': 'Missing item_id'}), 200
+        return jsonify({'success': False, 'debug': 'Missing item_id', 'resolved_url': purl}), 200
+
+    if not shopid and purl:
+        m = re.search(r'product\/(\d+)\/\d+', purl)
+        if m:
+            shopid = m.group(1)
 
     cookie = clean_cookie(COOKIE)
     h = {
@@ -80,10 +126,14 @@ def commission():
         try:
             d = r.json()
         except Exception:
-            return jsonify({'success': False, 'debug': 'Shopee returned HTML', 'http': r.status_code}), 200
+            pub = get_public_product(shopid, item_id) if shopid else None
+            return jsonify({'success': False, 'debug': 'Shopee returned HTML', 'fallback': pub}), 200
 
         if d.get('code') != 0:
-            return jsonify({'success': False, 'debug': 'Shopee error', 'code': d.get('code'), 'msg': d.get('msg'), 'raw': d}), 200
+            if d.get('error') == 90309999:
+                pub = get_public_product(shopid, item_id) if shopid else None
+                return jsonify({'success': False, 'debug': 'Cookie dead (90309999)', 'fallback': pub}), 200
+            return jsonify({'success': False, 'debug': 'Shopee error', 'code': d.get('code'), 'msg': d.get('msg')}), 200
 
         data = d.get('data', {})
         cr = data.get('commission_rate') or {}
@@ -110,15 +160,14 @@ def commission():
             'cashback_percent': 50
         })
     except Exception as e:
-        return jsonify({'success': False, 'debug': str(e)}), 200
+        pub = get_public_product(shopid, item_id) if shopid else None
+        return jsonify({'success': False, 'debug': str(e), 'fallback': pub}), 200
 
-# ========== ORDERS ==========
 @app.route("/api/orders", methods=["GET"])
 def orders():
     sub_id = request.args.get('sub_id')
     if not sub_id:
         return jsonify({'error': 'Missing sub_id'}), 400
-
     qs = urllib.parse.urlencode({
         'page_size': request.args.get('page_size', '20'),
         'page_num': request.args.get('page_num', '1'),
@@ -128,11 +177,7 @@ def orders():
         'version': '1'
     })
     cookie = clean_cookie(COOKIE)
-    h = {
-        "content-type": "application/json",
-        "cookie": cookie,
-        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
-    }
+    h = {"content-type": "application/json", "cookie": cookie, "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"}
     try:
         r = requests.get(f"https://affiliate.shopee.vn/api/v3/report/list?{qs}", headers=h, timeout=20)
         d = r.json()
@@ -159,33 +204,6 @@ def orders():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-# ========== TEST COOKIE ==========
-@app.route("/api/test", methods=["POST"])
-def test():
-    data = request.get_json() or {}
-    cookie = clean_cookie(data.get('cookie', COOKIE))
-    item_id = data.get('item_id', '23881637574')
-    if not cookie:
-        return jsonify({'error': 'No cookie'}), 400
-    h = {
-        "content-type": "application/json",
-        "cookie": cookie,
-        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-        "referer": "https://affiliate.shopee.vn/",
-        "accept": "application/json"
-    }
-    r = requests.get(f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}", headers=h, timeout=20)
-    try:
-        d = r.json()
-    except:
-        return jsonify({'http': r.status_code, 'json': False, 'preview': r.text[:500]}), 200
-    return jsonify({
-        'http': r.status_code, 'json': True,
-        'code': d.get('code'), 'msg': d.get('msg'),
-        'has_commission_rate': bool((d.get('data') or {}).get('commission_rate')),
-        'raw': d
-    }), 200
 
 @app.route("/", methods=["GET"])
 def health():
