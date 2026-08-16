@@ -1,3 +1,6 @@
+// API route - chỉ chạy khi có request, không chạy trong build
+export const config = { runtime: 'nodejs' };
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -12,30 +15,17 @@ export default async function handler(req, res) {
   const { action } = req.query;
   const cookie = process.env.SHOPEE_AFFILIATE_COOKIE || '';
 
-  // ========== DEBUG: Kiểm tra cookie ==========
-  const debugCookie = {
-    length: cookie.length,
-    hasSpEc: cookie.includes('SPC_EC=') && !cookie.includes('SPC_EC=-'),
-    hasCsrf: cookie.includes('csrftoken='),
-    hasSpTid: cookie.includes('SPC_T_ID='),
-    csrfValue: '',
-    cookiePreview: cookie.substring(0, 80) + '...'
-  };
-  const csrfMatch = cookie.match(/csrftoken=([^;]+)/);
-  if (csrfMatch) debugCookie.csrfValue = csrfMatch[1].substring(0, 10) + '...';
-
-  console.log('[DEBUG COOKIE]', JSON.stringify(debugCookie));
-  // ===========================================
-
   try {
-    if (req.method === 'POST' && action === 'link') return await createLink(req, res, cookie, debugCookie);
-    if (req.method === 'GET' && action === 'commission') return await getCommission(req, res, cookie, debugCookie);
-    if (req.method === 'GET' && action === 'orders') return await getOrders(req, res, cookie, debugCookie);
-    return res.status(400).json({ ok: false, error: 'Invalid action' });
+    if (req.method === 'POST' && action === 'link') return await createLink(req, res, cookie);
+    if (req.method === 'GET' && action === 'commission') return await getCommission(req, res, cookie);
+    if (req.method === 'GET' && action === 'orders') return await getOrders(req, res, cookie);
+    return res.status(400).json({ ok: false, error: 'Invalid action. Use ?action=link|commission|orders' });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
 }
+
+/* ===== HELPERS - không gọi API ở top-level ===== */
 
 function getCsrf(cookie) {
   const m = cookie.match(/csrftoken=([^;]+)/);
@@ -52,7 +42,6 @@ async function shopeeFetch(path, opts, cookie) {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
       'Accept': 'application/json, text/plain, */*',
       'Accept-Language': 'vi-VN,vi;q=0.9,en;q=0.8',
-      'Accept-Encoding': 'gzip, deflate, br',
       'Referer': 'https://affiliate.shopee.vn/marketing/tools/custom-link',
       'Origin': 'https://affiliate.shopee.vn',
       'X-Requested-With': 'XMLHttpRequest',
@@ -95,7 +84,9 @@ function parseVnd(s) {
   return isNaN(n) ? 0 : n;
 }
 
-async function createLink(req, res, cookie, debugCookie) {
+/* ===== ACTIONS ===== */
+
+async function createLink(req, res, cookie) {
   let { url } = req.body || {};
   if (!url?.includes('shopee.vn')) {
     return res.status(400).json({ ok: false, error: 'Thiếu hoặc sai link Shopee' });
@@ -124,21 +115,21 @@ async function createLink(req, res, cookie, debugCookie) {
   const r = await shopeeFetch('/api/v3/gql?q=batchCustomLink', { method: 'POST', body: JSON.stringify(body) }, cookie);
 
   if (!r.json) {
-    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text.slice(0, 500), debugCookie });
+    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text.slice(0, 500) });
   }
 
   const item = r.json?.data?.batchCustomLink?.[0];
   if (!item) {
-    return res.status(502).json({ ok: false, error: 'Không có batchCustomLink', status: r.status, raw: r.json, debugCookie });
+    return res.status(502).json({ ok: false, error: 'Không có batchCustomLink', status: r.status, raw: r.json });
   }
   if (item.failCode !== 0) {
-    return res.status(400).json({ ok: false, error: `Shopee failCode: ${item.failCode}`, raw: r.json, debugCookie });
+    return res.status(400).json({ ok: false, error: `Shopee failCode: ${item.failCode}`, raw: r.json });
   }
 
   return res.json({ ok: true, data: { shortLink: item.shortLink, longLink: item.longLink } });
 }
 
-async function getCommission(req, res, cookie, debugCookie) {
+async function getCommission(req, res, cookie) {
   let { url } = req.query;
   if (!url) return res.status(400).json({ ok: false, error: 'Thiếu ?url=' });
 
@@ -149,12 +140,12 @@ async function getCommission(req, res, cookie, debugCookie) {
   const r = await shopeeFetch(`/api/v3/offer/product?item_id=${itemId}`, {}, cookie);
 
   if (!r.json) {
-    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text?.slice(0, 500), debugCookie });
+    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text?.slice(0, 500) });
   }
 
   const j = r.json;
   if (j.code !== 0 || !j.data) {
-    return res.status(502).json({ ok: false, error: 'Lỗi dữ liệu Shopee', raw: j, debugCookie });
+    return res.status(502).json({ ok: false, error: 'Lỗi dữ liệu Shopee', raw: j });
   }
 
   const item = j.data.batch_item_for_item_card_full || {};
@@ -187,7 +178,7 @@ async function getCommission(req, res, cookie, debugCookie) {
   });
 }
 
-async function getOrders(req, res, cookie, debugCookie) {
+async function getOrders(req, res, cookie) {
   const { sub_id, page_num = 1, page_size = 20, purchase_time_s, purchase_time_e, version = 1 } = req.query;
   if (!sub_id) return res.status(400).json({ ok: false, error: 'Thiếu ?sub_id=' });
 
@@ -202,7 +193,7 @@ async function getOrders(req, res, cookie, debugCookie) {
   const r = await shopeeFetch(`/api/v3/offer/orders?${qs.toString()}`, {}, cookie);
 
   if (!r.json) {
-    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text?.slice(0, 500), debugCookie });
+    return res.status(502).json({ ok: false, error: 'Shopee trả về không phải JSON', status: r.status, raw: r.text?.slice(0, 500) });
   }
 
   return res.json({ ok: r.json.code === 0, data: r.json.data || null, msg: r.json.msg, raw: r.json });
