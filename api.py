@@ -24,9 +24,7 @@ TRAILING_PUNCT = '.,;:!?)]}\'"'
 # ══════════════════════════════════════════════════════════════
 
 def require_auth():
-    key = request.headers.get('x-api-key', '')
-    if key != INTERNAL_API_KEY:
-        return jsonify({'error': 'Unauthorized'}), 401
+    # Bỏ qua xác thực key
     return None
 
 
