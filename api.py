@@ -39,6 +39,42 @@ def format_vnd(num):
     except:
         return "₫0"
 
+def get_csrf_from_cookie(cookie_str):
+    """Extract csrftoken from cookie string if present"""
+    m = re.search(r'csrftoken=([^;]+)', cookie_str)
+    if m:
+        return m.group(1)
+    return ''
+
+def get_product_public(shopid, itemid):
+    """Fallback: lấy thông tin SP từ API public"""
+    try:
+        r = requests.get(
+            f"https://shopee.vn/api/v4/item/get?itemid={itemid}&shopid={shopid}",
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json',
+                'Referer': f'https://shopee.vn/product/{shopid}/{itemid}'
+            }, timeout=10)
+        d = r.json()
+        if not d.get('data') or not d['data'].get('item'):
+            return None
+        item = d['data']['item']
+        p = item.get('price', 0)
+        try:
+            price = f"₫{int(p)/100000:,.0f}".replace(',', '.')
+        except:
+            price = ''
+        return {
+            'name': item.get('name', 'Sản phẩm'),
+            'image': item.get('image', ''),
+            'price': price,
+            'raw_price': int(p) if p else 0
+        }
+    except Exception as e:
+        print(f"[SaleVN API] Public API error: {e}")
+        return None
+
 @app.route("/api/convert", methods=["POST"])
 def convert():
     data = request.get_json() or {}
@@ -76,6 +112,7 @@ def convert():
 @app.route("/api/commission", methods=["GET"])
 def commission():
     item_id = request.args.get('item_id', '')
+    shop_id = request.args.get('shop_id', '')
     raw_url = request.args.get('url', '')
 
     if not item_id:
@@ -85,67 +122,123 @@ def commission():
     if not cookie:
         return jsonify({'success': False, 'error': 'No cookie configured on server'}), 200
 
+    # Thử lấy từ API affiliate trước
+    affiliate_data = None
     try:
+        csrf = get_csrf_from_cookie(cookie)
         h = {
+            "accept": "application/json",
             "content-type": "application/json",
             "cookie": cookie,
-            "referer": "https://affiliate.shopee.vn/",
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            "origin": "https://affiliate.shopee.vn",
+            "referer": f"https://affiliate.shopee.vn/offer/product?item_id={item_id}",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "x-requested-with": "XMLHttpRequest",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin"
         }
+        if csrf:
+            h["x-csrftoken"] = csrf
 
-        api_url = f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}"
-        print(f"[SaleVN API] Calling: {api_url}")
+        # Thử GET trước
+        qs = f"item_id={item_id}"
+        if shop_id:
+            qs += f"&shop_id={shop_id}"
 
+        api_url = f"https://affiliate.shopee.vn/api/v3/offer/product?{qs}"
+        print(f"[SaleVN API] GET {api_url}")
         r = requests.get(api_url, headers=h, timeout=20)
-        print(f"[SaleVN API] Status: {r.status_code}, Len: {len(r.text)}")
+        print(f"[SaleVN API] GET status: {r.status_code}, len: {len(r.text)}")
 
-        # Nếu Shopee trả về status lỗi, log raw để debug
+        # Nếu GET 403, thử POST
+        if r.status_code == 403:
+            print("[SaleVN API] GET 403, trying POST...")
+            post_body = {"item_id": str(item_id)}
+            if shop_id:
+                post_body["shop_id"] = str(shop_id)
+            r = requests.post(
+                "https://affiliate.shopee.vn/api/v3/offer/product",
+                headers=h, json=post_body, timeout=20
+            )
+            print(f"[SaleVN API] POST status: {r.status_code}, len: {len(r.text)}")
+
         if r.status_code != 200:
-            raw_snippet = r.text[:500]
-            print(f"[SaleVN API] Raw response: {raw_snippet}")
-            return jsonify({
-                'success': False,
-                'error': f'Shopee returned HTTP {r.status_code}',
-                'raw_snippet': raw_snippet
-            }), 200
+            raw_snippet = r.text[:300]
+            print(f"[SaleVN API] Raw: {raw_snippet}")
+            # Không return lỗi ngay, chuyển sang fallback
+            raise Exception(f"HTTP {r.status_code}")
 
-        # Parse JSON
         try:
             d = r.json()
         except Exception as je:
-            raw_snippet = r.text[:500]
-            print(f"[SaleVN API] JSON parse error: {je} | Raw: {raw_snippet}")
-            return jsonify({
-                'success': False,
-                'error': 'JSON parse error from Shopee',
-                'raw_snippet': raw_snippet
-            }), 200
+            print(f"[SaleVN API] JSON parse error: {je}")
+            raise Exception("JSON parse error")
 
         shopee_code = d.get('code')
         shopee_msg = d.get('msg', '')
 
         if shopee_code != 0:
-            print(f"[SaleVN API] Shopee error code={shopee_code}, msg={shopee_msg}")
-            return jsonify({
-                'success': False,
-                'error': f'Shopee API error: {shopee_msg} (code {shopee_code})',
-                'detail': d
-            }), 200
+            print(f"[SaleVN API] Shopee code={shopee_code}, msg={shopee_msg}")
+            raise Exception(f"Shopee API error: {shopee_msg} (code {shopee_code})")
 
         data = d.get('data')
         if not data:
+            raise Exception("Empty data")
+
+        affiliate_data = data
+
+    except Exception as e:
+        print(f"[SaleVN API] Affiliate API failed: {e}")
+        affiliate_data = None
+
+    # Nếu affiliate thất bại, dùng public API làm fallback
+    if not affiliate_data:
+        if not shop_id:
+            # Thử extract shop_id từ URL
+            sid, _ = extract_ids(raw_url)
+            if sid:
+                shop_id = sid
+
+        if not shop_id:
             return jsonify({
                 'success': False,
-                'error': 'Shopee returned empty data (product may not be in affiliate program)'
+                'error': 'Không thể lấy thông tin hoa hồng. Vui lòng đảm bảo cookie affiliate còn hiệu lực.'
             }), 200
 
+        pub = get_product_public(shop_id, item_id)
+        if not pub:
+            return jsonify({
+                'success': False,
+                'error': 'Không thể lấy thông tin sản phẩm từ cả 2 nguồn.'
+            }), 200
+
+        # Fallback: hiển thị thông tin SP + hoàn tiền ước tính theo % chung
+        price_val = pub['raw_price']
+        est_comm = int(price_val * 0.05 / 100000)  # ước tính 5%
+        cashback = est_comm // 2
+
+        return jsonify({
+            'success': True,
+            'item_id': item_id,
+            'product_name': pub['name'],
+            'image': pub['image'],
+            'price': pub['price'],
+            'seller_commission_rate': '~5% (ước tính)',
+            'estimated_commission': format_vnd(est_comm),
+            'estimated_cashback': format_vnd(cashback),
+            'cashback_percent': 50,
+            'note': 'Ước tính do API affiliate bị chặn (403). Số tiền thực tế có thể khác.'
+        })
+
+    # Xử lý dữ liệu affiliate
+    try:
+        data = affiliate_data
         item = data.get('batch_item_for_item_card_full') or {}
 
-        # 1. Tên & ảnh sản phẩm
         product_name = item.get('name', 'Sản phẩm Shopee')
         image = item.get('image', '')
 
-        # 2. Giá bán (đơn vị trong response là *100.000 VND)
         raw_price = item.get('price', '0')
         try:
             price_val = int(raw_price) / 100000
@@ -154,15 +247,11 @@ def commission():
             price_str = ''
             price_val = 0
 
-        # 3. Hoa hồng người bán thực tế
         comm_rate = data.get('commission_rate', {})
         seller_commission_str = comm_rate.get('seller_commission') or data.get('commission', '₫0') or '₫0'
         seller_commission_num = parse_vnd_number(seller_commission_str)
-
-        # 4. Tỷ lệ % người bán trả
         seller_rate = comm_rate.get('seller_commission_rate', '~5%')
 
-        # 5. Tính hoàn tiền cho user = 50% hoa hồng người bán
         cashback_num = seller_commission_num // 2
         cashback_str = format_vnd(cashback_num)
 
@@ -179,12 +268,9 @@ def commission():
             'estimated_cashback': cashback_str,
             'cashback_percent': 50
         })
-
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        print(f"[SaleVN API] Exception: {e}\n{tb}")
-        return jsonify({'success': False, 'error': str(e), 'traceback': tb}), 200
+        print(f"[SaleVN API] Parse affiliate data error: {e}")
+        return jsonify({'success': False, 'error': f'Parse error: {str(e)}'}), 200
 
 @app.route("/api/orders", methods=["GET"])
 def orders():
