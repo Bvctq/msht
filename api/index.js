@@ -1,6 +1,3 @@
-// Shopee Affiliate Cashback API - Single File
-// Routes: /api/convert, /api/commission, /api/orders
-
 const SHOPEE_COOKIE = process.env.SHOPEE_COOKIE || '';
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY || '';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
@@ -27,7 +24,7 @@ async function shopeeFetch(url, opts = {}) {
     ...opts,
     headers: {
       'Cookie': SHOPEE_COOKIE,
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
       'Accept': 'application/json',
       'Accept-Language': 'vi-VN,vi;q=0.9',
       'Referer': 'https://affiliate.shopee.vn/',
@@ -38,7 +35,7 @@ async function shopeeFetch(url, opts = {}) {
   });
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error('Shopee ' + res.status + ': ' + txt.slice(0, 200));
+    throw new Error('Shopee ' + res.status + ': ' + txt.slice(0, 300));
   }
   return res.json();
 }
@@ -84,7 +81,7 @@ async function handleConvert(req, res) {
       }
     }`,
     variables: {
-      linkParams: [{ originalLink: url, advancedLinkParams: {} }],
+      linkParams: [{ originalLink: url }],
       sourceCaller: "CUSTOM_LINK_CALLER"
     }
   };
